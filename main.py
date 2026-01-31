@@ -151,6 +151,8 @@ async def lifespan(app: FastAPI):
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
+        # 用于前端判断是否需要进入初始化向导
+        app.state.needs_setup = not bool(app.state.api_list)
         # from ruamel.yaml.timestamp import TimeStamp
         # def json_default(obj):
         #     if isinstance(obj, TimeStamp):
@@ -190,7 +192,10 @@ async def lifespan(app: FastAPI):
                 else:
                     raise HTTPException(
                         status_code=500,
-                        detail={"error": "No API key found in api.yaml"}
+                        detail={
+                            "error": "No API key found in configuration.",
+                            "hint": "Provide one of: DATABASE config in DB (CONFIG_STORAGE=auto), CONFIG_YAML/CONFIG_YAML_BASE64, CONFIG_URL, api.yaml (file mode), or set ADMIN_API_KEY / use /setup wizard.",
+                        },
                     )
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)

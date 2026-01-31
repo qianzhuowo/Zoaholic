@@ -23,7 +23,7 @@ from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.log_config import logger
-from db import Base, RequestStat, ChannelStat, AppConfig, db_engine, async_session, DISABLE_DATABASE, DB_TYPE
+from db import Base, RequestStat, ChannelStat, AppConfig, AdminUser, db_engine, async_session, DISABLE_DATABASE, DB_TYPE
 
 # SQLite 写入重试配置
 SQLITE_MAX_RETRIES = 3
@@ -148,7 +148,7 @@ async def create_tables():
         if db_type in ["sqlite", "postgres"]:
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
-                for table in [RequestStat, ChannelStat, AppConfig]:
+                for table in [RequestStat, ChannelStat, AppConfig, AdminUser]:
                     table_name = table.__tablename__
                     existing_columns = {col['name'] for col in inspector.get_columns(table_name)}
 

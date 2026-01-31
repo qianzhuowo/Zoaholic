@@ -219,6 +219,21 @@ class ChannelStat(Base):
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class AdminUser(Base):
+    """管理员账号（用于首次初始化向导 /setup）。
+
+    说明：
+    - 仅保存一个管理员（id=1）
+    - password_hash 为 PBKDF2-HMAC-SHA256 的字符串格式
+    """
+
+    __tablename__ = "admin_user"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+
+
 class AppConfig(Base):
     """配置存储表（用于将配置入库）。
 

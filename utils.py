@@ -473,7 +473,31 @@ async def load_config(app=None):
                 conf_seed = None
 
     if not conf_seed or not isinstance(conf_seed, dict):
-        return {}, {}, []
+        # 兜底：允许用环境变量提供一个“启动用”的管理员 key，便于在云平台上首次启动后
+        # 通过 /admin 页面或 /v1/api_config/update 完成配置，并把配置持久化到数据库。
+        #
+        # 支持：
+        # - ADMIN_API_KEY=sk-xxxx
+        # - ADMIN_API_KEYS=sk-xxx,sk-yyy
+        admin_keys_raw = (os.getenv("ADMIN_API_KEYS") or os.getenv("ADMIN_API_KEY") or "").strip()
+        if admin_keys_raw:
+            admin_keys = [k.strip() for k in admin_keys_raw.split(",") if k.strip()]
+            if admin_keys:
+                conf_seed = {
+                    "providers": [],
+                    "api_keys": [
+                        {
+                            "api": k,
+                            "role": "admin",
+                            # 保持与原配置结构一致，后续 update_config 会进一步规范化
+                            "model": ["all"],
+                        }
+                        for k in admin_keys
+                    ],
+                    "preferences": {},
+                }
+        if not conf_seed or not isinstance(conf_seed, dict):
+            return {}, {}, []
 
     # 4) 规范化配置（不写回文件，避免启动时污染）
     config, api_keys_db, api_list = await update_config(

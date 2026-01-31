@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { useNavigate } from 'react-router-dom';
 import { Activity, Key, LogIn } from 'lucide-react';
@@ -9,6 +9,24 @@ export default function Login() {
   const [error, setError] = useState('');
   const login = useAuthStore((state) => state.login);
   const navigate = useNavigate();
+
+  // 若后端提示需要初始化，则跳转到 /setup
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch('/setup/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.needs_setup) {
+            navigate('/setup');
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    check();
+  }, [navigate]);
 
   const handleLogin = async (e: import('react').FormEvent) => {
     e.preventDefault();

@@ -7,6 +7,7 @@ import Settings from './pages/Settings';
 import Logs from './pages/Logs';
 import Layout from './components/Layout';
 import Login from './pages/Login';
+import Setup from './pages/Setup';
 import { useAuthStore } from './store/authStore';
 
 // 导入 themeStore 以确保主题初始化代码执行
@@ -18,6 +19,7 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
+        <Route path="/setup" element={<Setup />} />
         <Route path="/login" element={isAuthenticated ? <Navigate to="/" /> : <Login />} />
 
         <Route path="/" element={isAuthenticated ? <Layout /> : <Navigate to="/login" />}>
