@@ -27,17 +27,12 @@ try:
                 if "unknown type: pg_catalog.json" not in msg:
                     raise
 
-                # Fallback: only register jsonb codec using text format
-                serializer = getattr(self, "_json_serializer", None) or _json_module.dumps
-                deserializer = getattr(self, "_json_deserializer", None) or _json_module.loads
-
-                await asyncpg_connection.set_type_codec(
-                    "jsonb",
-                    schema="pg_catalog",
-                    encoder=lambda obj: serializer(obj),
-                    decoder=lambda s: deserializer(s),
-                    format="text",
-                )
+                # CockroachDB 兼容：没有 pg_catalog.json 时，直接跳过 SQLAlchemy 的 json codec 注册。
+                # asyncpg 对 jsonb 通常仍能使用默认 codec；且我们业务侧也可容忍 json 以文本形式返回。
+                return None
+            except AttributeError:
+                # 某些 SQLAlchemy/asyncpg 组合下传入的连接适配器不暴露 set_type_codec 等方法。
+                # 直接跳过 codec 注册即可。
                 return None
 
         _PGDialect_asyncpg.setup_asyncpg_json_codec = _patched_setup_asyncpg_json_codec
