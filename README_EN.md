@@ -69,6 +69,14 @@ Environment variables:
 - `ADMIN_API_KEY` / `ADMIN_API_KEYS`: if no config source is available (DB/api.yaml/CONFIG_URL/CONFIG_YAML), Zoaholic will generate a minimal boot config containing only admin key(s), so you can start the service first and then update/persist full config via admin APIs.
 - Setup wizard (newapi-like): visit `/setup` to set admin username/password. Zoaholic will generate an admin API key, persist a minimal config into DB, then you can continue configuring providers/api_keys in the console.
 
+## Username/Password + JWT (Admin console login)
+
+- Login: `POST /auth/login` (returns JWT)
+- Current user: `GET /auth/me`
+
+Production required:
+- `JWT_SECRET=...` (used to sign/verify JWT)
+
 - `CONFIG_STORAGE=auto|db|file|url`
   - `auto` (default): prefer DB when available
   - `db`: force DB-first (fallback seed then persist into DB)

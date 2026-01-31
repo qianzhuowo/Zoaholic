@@ -167,6 +167,14 @@ Zoaholic 的统计/日志功能使用数据库保存（SQLAlchemy async），并
 - `ADMIN_API_KEY` / `ADMIN_API_KEYS`：当没有任何配置来源（DB/api.yaml/CONFIG_URL/CONFIG_YAML）可用时，用于生成一个最小可启动配置（仅包含管理员 key），方便你先启动服务再通过管理接口写入完整配置并入库。
 - 初始化向导（newapi-like）：访问 `/setup`，设置管理员用户名/密码，系统会生成管理员 API Key 并把最小配置写入数据库，然后你可以在控制台继续配置 providers/api_keys。
 
+### 账号密码 + JWT（管理控制台登录）
+
+- 登录接口：`POST /auth/login`（返回 JWT）
+- 当前用户：`GET /auth/me`
+
+生产环境请务必设置：
+- `JWT_SECRET=...`（用于签发/校验 JWT；不设置会使用不安全的默认值，且重启可能导致 token 失效）
+
 - `CONFIG_STORAGE=auto|db|file|url`
   - `auto`：默认，DB 可用则优先 DB
   - `db`：强制优先 DB（无则回退读取一次并写回 DB）

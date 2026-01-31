@@ -40,7 +40,7 @@ interface LogEntry {
 }
 
 export default function Logs() {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
@@ -60,7 +60,7 @@ export default function Logs() {
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
   const fetchLogs = async (resetPage = false) => {
-    if (!apiKey) return;
+    if (!token) return;
     setLoading(true);
 
     const currentPage = resetPage ? 1 : page;
@@ -78,7 +78,7 @@ export default function Logs() {
       if (filterSuccess === 'FAILED') queryParams.append('success', 'false');
 
       const res = await fetch(`/v1/logs?${queryParams.toString()}`, {
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
 
       if (res.ok) {

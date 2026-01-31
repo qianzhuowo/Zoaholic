@@ -77,9 +77,8 @@ export default function Setup() {
         return;
       }
 
-      // 仍使用 API Key 作为前端鉴权 token（兼容现有接口）
-      login(adminApiKey, 'admin');
-      navigate('/');
+      // 初始化后进入登录页（建议使用账号密码 + JWT 登录）
+      navigate('/login');
     } catch {
       setError('网络错误，请检查后端服务是否正常启动');
     } finally {

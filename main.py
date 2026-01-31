@@ -175,28 +175,19 @@ async def lifespan(app: FastAPI):
                 )
         app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
 
-        app.state.admin_api_key = []
-        for item in app.state.api_keys_db:
-            if "admin" in item.get("role", ""):
-                app.state.admin_api_key.append(item.get("api"))
-        if app.state.admin_api_key == []:
-            if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
-            else:
-                from utils import yaml_error_message
-                if yaml_error_message:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": yaml_error_message}
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={
-                            "error": "No API key found in configuration.",
-                            "hint": "Provide one of: DATABASE config in DB (CONFIG_STORAGE=auto), CONFIG_YAML/CONFIG_YAML_BASE64, CONFIG_URL, api.yaml (file mode), or set ADMIN_API_KEY / use /setup wizard.",
-                        },
-                    )
+        # 如果没有任何 API key，则标记需要初始化并允许服务启动（用于 /setup 初始化向导）
+        if not app.state.api_keys_db or not app.state.api_list:
+            app.state.needs_setup = True
+            app.state.admin_api_key = []
+        else:
+            app.state.admin_api_key = []
+            for item in app.state.api_keys_db:
+                if "admin" in item.get("role", ""):
+                    app.state.admin_api_key.append(item.get("api"))
+            if app.state.admin_api_key == []:
+                # 兼容旧配置：如果没显式标记 admin，就默认第一把 key 为 admin
+                if len(app.state.api_keys_db) >= 1:
+                    app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)

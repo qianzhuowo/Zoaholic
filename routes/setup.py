@@ -127,7 +127,13 @@ async def setup_status():
 
 @router.post("/init", response_model=SetupInitResponse)
 async def setup_init(payload: SetupInitRequest = Body(...)):
-    """首次初始化：设置管理员账号密码，并写入最小可用配置到 DB。"""
+    """首次初始化：设置管理员账号密码，并写入最小可用配置到 DB。
+
+    返回：管理员 API Key（用于 OpenAI 兼容 API 的管理接口鉴权）。
+
+    注意：
+    - 后续建议通过 /auth/login 使用“账号密码 + JWT”登录管理控制台。
+    """
 
     if DISABLE_DATABASE or async_session is None:
         raise HTTPException(
