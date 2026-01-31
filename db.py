@@ -1,4 +1,7 @@
 import os
+import ssl as ssl_module
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 from sqlalchemy import event
 
 from core.env import env_bool
@@ -49,6 +52,72 @@ def _normalize_database_url(url: str, db_type: str) -> str:
         return url
 
     return url
+
+
+def _extract_asyncpg_ssl_connect_args(db_url: str) -> tuple[str, dict]:
+    """从 URL query 中提取 PostgreSQL SSL 参数，转换为 asyncpg 可识别的 connect_args。
+
+    背景：
+    - 许多平台/服务提供的 DATABASE_URL 会带 `?sslmode=...`
+    - 但 asyncpg.connect() 不接受 sslmode 这个关键字参数，会导致：
+      `TypeError: connect() got an unexpected keyword argument 'sslmode'`
+
+    处理：
+    - 从 URL 中移除 sslmode/sslrootcert 等参数，避免被 SQLAlchemy 透传给 asyncpg
+    - 根据 sslmode 构造 asyncpg 所需的 `ssl=` 参数（bool 或 SSLContext）
+
+    返回： (clean_url, connect_args)
+    """
+
+    parts = urlsplit(db_url)
+    qsl = parse_qsl(parts.query, keep_blank_values=True)
+
+    sslmode = None
+    sslrootcert = None
+    kept: list[tuple[str, str]] = []
+
+    for k, v in qsl:
+        lk = k.lower()
+        if lk == "sslmode":
+            sslmode = v
+        elif lk == "sslrootcert":
+            sslrootcert = v
+        else:
+            kept.append((k, v))
+
+    connect_args: dict = {}
+
+    if sslmode:
+        mode = str(sslmode).strip().lower()
+
+        # 参考 libpq sslmode 语义：disable / allow / prefer / require / verify-ca / verify-full
+        if mode in ("disable", "false", "0", "off"):
+            connect_args["ssl"] = False
+        elif mode in ("require",):
+            # require：加密但不校验证书
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_NONE
+            connect_args["ssl"] = ctx
+        elif mode in ("verify-ca", "verify_ca"):
+            # verify-ca：校验证书链，但不校验主机名
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+        else:
+            # 默认：prefer / allow / verify-full / 其它
+            # verify-full：校验证书链 + 校验主机名（默认 context 就是该语义）
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            # 确保 verify-full 语义
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+
+    new_query = urlencode(kept, doseq=True)
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    return clean_url, connect_args
 
 
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -159,8 +228,11 @@ if not DISABLE_DATABASE:
         except ImportError:
             raise ImportError("asyncpg is not installed. Please install it with 'pip install asyncpg' to use PostgreSQL.")
 
+        connect_args = {}
         if DATABASE_URL:
             db_url = _normalize_database_url(DATABASE_URL, DB_TYPE)
+            # 兼容 ?sslmode=...（asyncpg 不识别 sslmode，需要转换为 ssl 参数）
+            db_url, connect_args = _extract_asyncpg_ssl_connect_args(db_url)
         else:
             DB_USER = os.getenv("DB_USER", "postgres")
             DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
@@ -169,7 +241,7 @@ if not DISABLE_DATABASE:
             DB_NAME = os.getenv("DB_NAME", "postgres")
             db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-        db_engine = create_async_engine(db_url, echo=is_debug)
+        db_engine = create_async_engine(db_url, echo=is_debug, connect_args=connect_args)
 
     elif DB_TYPE == "sqlite":
         if DATABASE_URL:
