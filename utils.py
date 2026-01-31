@@ -106,22 +106,34 @@ async def save_config_to_db(config_data: dict) -> None:
     """把配置写入数据库（app_config 表，id=1）。
 
     主存储为 JSON/JSONB（config_json）。
+    - Postgres/CockroachDB：存 dict（SQLAlchemy JSONB）或存 JSON 字符串（回退）
     另外会同步存一份 YAML（config_yaml）便于人工排查（可选）。
     """
 
     if DISABLE_DATABASE or async_session is None:
         return
 
-    config_json = dump_config_to_json_obj(config_data)
+    config_obj = dump_config_to_json_obj(config_data)
     config_yaml = dump_config_to_yaml_text(config_data)
+
+    # 若底层字段是 Text（例如我们对非 Postgres dialect 做的回退），存 JSON 字符串
+    config_json_value = config_obj
+    try:
+        from db import AppConfig as _AppConfigModel
+        col_type_name = type(_AppConfigModel.__table__.c.config_json.type).__name__.lower()
+        if "text" in col_type_name:
+            import json as _json
+            config_json_value = _json.dumps(config_obj, ensure_ascii=False)
+    except Exception:
+        pass
 
     async with async_session() as session:
         existing = await session.get(AppConfig, 1)
         if existing is None:
-            existing = AppConfig(id=1, config_json=config_json, config_yaml=config_yaml)
+            existing = AppConfig(id=1, config_json=config_json_value, config_yaml=config_yaml)
             session.add(existing)
         else:
-            existing.config_json = config_json
+            existing.config_json = config_json_value
             existing.config_yaml = config_yaml
         await session.commit()
 
@@ -145,6 +157,15 @@ async def load_config_from_db() -> Optional[dict]:
             data = row.config_json
             if isinstance(data, dict):
                 return data
+            # 兼容：若字段是 Text 回退，可能存的是 JSON 字符串
+            if isinstance(data, str) and data.strip():
+                import json as _json
+                try:
+                    parsed = _json.loads(data)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
 
         # 2) 兼容旧 YAML（如果有的话）
         if getattr(row, "config_yaml", None):

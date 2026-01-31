@@ -7,6 +7,45 @@ from sqlalchemy import event
 from core.env import env_bool
 from sqlalchemy.sql import func
 
+# --- CockroachDB compatibility (asyncpg / SQLAlchemy) ---
+# CockroachDB 并不一定提供 pg_catalog.json 类型（通常只有 jsonb）。
+# SQLAlchemy 的 postgresql+asyncpg 方言会在连接时尝试注册 json/jsonb codec，
+# 在 CockroachDB 上可能报错：ValueError: unknown type: pg_catalog.json
+# 这里对 SQLAlchemy 的 codec 注册逻辑做一个兼容补丁：若 json 类型不存在，则仅注册 jsonb。
+try:
+    import json as _json_module
+    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg as _PGDialect_asyncpg
+
+    if not getattr(_PGDialect_asyncpg, "_zoaholic_crdb_json_patch", False):
+        _orig_setup = _PGDialect_asyncpg.setup_asyncpg_json_codec
+
+        async def _patched_setup_asyncpg_json_codec(self, asyncpg_connection, *args, **kwargs):
+            try:
+                return await _orig_setup(self, asyncpg_connection, *args, **kwargs)
+            except ValueError as e:
+                msg = str(e)
+                if "unknown type: pg_catalog.json" not in msg:
+                    raise
+
+                # Fallback: only register jsonb codec using text format
+                serializer = getattr(self, "_json_serializer", None) or _json_module.dumps
+                deserializer = getattr(self, "_json_deserializer", None) or _json_module.loads
+
+                await asyncpg_connection.set_type_codec(
+                    "jsonb",
+                    schema="pg_catalog",
+                    encoder=lambda obj: serializer(obj),
+                    decoder=lambda s: deserializer(s),
+                    format="text",
+                )
+                return None
+
+        _PGDialect_asyncpg.setup_asyncpg_json_codec = _patched_setup_asyncpg_json_codec
+        _PGDialect_asyncpg._zoaholic_crdb_json_patch = True
+except Exception:
+    # 兼容：未安装 sqlalchemy/asyncpg 时不处理
+    pass
+
 # Render / Railway 等平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
@@ -122,7 +161,7 @@ def _extract_asyncpg_ssl_connect_args(db_url: str) -> tuple[str, dict]:
 
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, JSON
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text
 
 # PostgreSQL 下使用 JSONB（更高效/可索引）；其它数据库回退到 JSON
 try:
@@ -200,7 +239,10 @@ class AppConfig(Base):
     id = Column(Integer, primary_key=True)
 
     # JSON/JSONB 配置
-    config_json = Column(_PG_JSONB if _PG_JSONB is not None else JSON, nullable=True)
+    # - PostgreSQL: JSONB
+    # - CockroachDB: 通常只有 JSONB（json 类型可能不存在）
+    # - 其它 DB: 回退到 Text/JSON（但当前主要用于 Postgres/Cockroach/SQLite）
+    config_json = Column(_PG_JSONB if _PG_JSONB is not None else Text, nullable=True)
 
     # 预留：便于人工导出/排查（可选，不参与主流程）
     config_yaml = Column(Text, nullable=True)
