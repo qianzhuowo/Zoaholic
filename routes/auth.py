@@ -7,6 +7,7 @@
 - API 网关的用户侧依旧支持 API Key。
 """
 
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -67,6 +68,16 @@ async def login(payload: LoginRequest = Body(...)):
 
     async with async_session() as session:
         admin_user = await session.get(AdminUser, 1)
+
+    # 若没有显式配置 JWT_SECRET，则优先使用 DB 中持久化的 jwt_secret
+    try:
+        from core.jwt_utils import set_jwt_secret
+
+        if not (os.getenv("JWT_SECRET") or "").strip():
+            if admin_user is not None and getattr(admin_user, "jwt_secret", None):
+                set_jwt_secret(str(admin_user.jwt_secret))
+    except Exception:
+        pass
 
     if admin_user is None:
         raise HTTPException(status_code=404, detail="Admin user not initialized. Please visit /setup.")

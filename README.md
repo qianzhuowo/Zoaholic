@@ -172,8 +172,11 @@ Zoaholic 的统计/日志功能使用数据库保存（SQLAlchemy async），并
 - 登录接口：`POST /auth/login`（返回 JWT）
 - 当前用户：`GET /auth/me`
 
-生产环境请务必设置：
-- `JWT_SECRET=...`（用于签发/校验 JWT；不设置会使用不安全的默认值，且重启可能导致 token 失效）
+生产环境建议设置：
+- `JWT_SECRET=...`（用于签发/校验 JWT）
+
+不想手动配置也可以：
+- 首次在 `/setup` 初始化时，系统会自动生成并把 `jwt_secret` 持久化到数据库（admin_user 表），后续重启会复用该值。
 
 - `CONFIG_STORAGE=auto|db|file|url`
   - `auto`：默认，DB 可用则优先 DB

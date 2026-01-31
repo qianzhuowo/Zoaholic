@@ -74,8 +74,11 @@ Environment variables:
 - Login: `POST /auth/login` (returns JWT)
 - Current user: `GET /auth/me`
 
-Production required:
+Production recommended:
 - `JWT_SECRET=...` (used to sign/verify JWT)
+
+If you don't want to manage env vars:
+- During first-time `/setup`, Zoaholic will auto-generate and persist `jwt_secret` into DB (admin_user table) and reuse it on restarts.
 
 - `CONFIG_STORAGE=auto|db|file|url`
   - `auto` (default): prefer DB when available

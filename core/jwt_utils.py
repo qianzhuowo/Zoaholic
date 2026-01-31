@@ -17,9 +17,35 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 
+_CACHED_SECRET: Optional[str] = None
+
+
+def set_jwt_secret(secret: str) -> None:
+    """设置当前进程使用的 JWT 签名密钥（通常由启动阶段从 DB/文件加载后注入）。"""
+
+    global _CACHED_SECRET
+    secret = (secret or "").strip()
+    if secret:
+        _CACHED_SECRET = secret
+
+
 def _jwt_secret() -> str:
-    # 线上必须显式设置，否则每次重启 token 都会失效。
-    return os.getenv("JWT_SECRET") or "dev-insecure-jwt-secret"
+    """获取 JWT 签名密钥。
+
+    优先级：
+    1) 进程内缓存（set_jwt_secret 注入）
+    2) 环境变量 JWT_SECRET（推荐，但不是必须）
+    3) 临时默认值（仅用于未初始化阶段；初始化后会写入 DB 并注入缓存）
+    """
+
+    if _CACHED_SECRET:
+        return _CACHED_SECRET
+
+    env = (os.getenv("JWT_SECRET") or "").strip()
+    if env:
+        return env
+
+    return "dev-insecure-jwt-secret"
 
 
 def issue_jwt(payload: Dict[str, Any], *, expires_in_seconds: int = 7 * 24 * 3600) -> str:

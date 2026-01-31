@@ -65,22 +65,26 @@ async def _get_admin_user():
         return await session.get(AdminUser, 1)
 
 
-async def _upsert_admin_user(username: str, password: str) -> None:
+async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> None:
     from db import AdminUser
 
     if DISABLE_DATABASE or async_session is None:
         raise HTTPException(status_code=500, detail="Database is disabled; cannot persist admin user.")
 
     pwd_hash = hash_password(password)
+    jwt_secret = (jwt_secret or "").strip()
 
     async with async_session() as session:
         existing = await session.get(AdminUser, 1)
         if existing is None:
-            existing = AdminUser(id=1, username=username, password_hash=pwd_hash)
+            existing = AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret)
             session.add(existing)
         else:
             existing.username = username
             existing.password_hash = pwd_hash
+            # 若之前没有 jwt_secret，则补上
+            if not getattr(existing, "jwt_secret", None):
+                existing.jwt_secret = jwt_secret
         await session.commit()
 
 
@@ -165,8 +169,17 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
         "preferences": {},
     }
 
-    # 1) 写入管理员账号
-    await _upsert_admin_user(payload.username.strip(), payload.password)
+    # 1) 写入管理员账号 + 生成并持久化 JWT secret（用户无需手动配置 JWT_SECRET 环境变量）
+    jwt_secret = secrets.token_urlsafe(48)
+    await _upsert_admin_user(payload.username.strip(), payload.password, jwt_secret)
+
+    # 同步到当前进程（避免无需重启即可登录）
+    try:
+        from core.jwt_utils import set_jwt_secret
+
+        set_jwt_secret(jwt_secret)
+    except Exception:
+        pass
 
     # 2) 写入配置到 DB，并更新内存态
     save_to_file = False

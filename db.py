@@ -225,6 +225,7 @@ class AdminUser(Base):
     说明：
     - 仅保存一个管理员（id=1）
     - password_hash 为 PBKDF2-HMAC-SHA256 的字符串格式
+    - jwt_secret：用于签发/校验 JWT（若未设置环境变量 JWT_SECRET，会使用该值）
     """
 
     __tablename__ = "admin_user"
@@ -232,6 +233,7 @@ class AdminUser(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String, nullable=False, index=True)
     password_hash = Column(String, nullable=False)
+    jwt_secret = Column(String, nullable=True)
 
 
 class AppConfig(Base):
