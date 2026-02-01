@@ -651,7 +651,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     # 检查 blockReason
     if isinstance(parsed_data, list) and len(parsed_data) > 0:
         first_resp = parsed_data[0]
-        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = await gemini_json_process(first_resp)
+        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(first_resp)
         
         if blockReason and blockReason != "STOP":
             msg = _extract_gemini_block_message(first_resp) or blockReason
@@ -779,7 +779,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                         continue
 
                 # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
-                is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = await gemini_json_process(response_json)
+                is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(response_json)
                 
                 # 调试日志：记录每个 chunk 的关键信息
                 from ..log_config import logger
