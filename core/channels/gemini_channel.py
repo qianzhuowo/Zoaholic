@@ -261,6 +261,8 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'parallel_tool_calls',
         'logit_bias',
         'service_tier',
+        # OpenAI stop sequences (Gemini 原生接口不接受 stop 顶层字段)
+        'stop',
     ]
     generation_config = {}
 
@@ -398,6 +400,17 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                 payload[field] = value
 
     payload["generationConfig"] = generation_config
+
+    # OpenAI stop -> Gemini generationConfig.stopSequences
+    # 说明：部分第三方客户端（如 SillyTavern）会携带 stop 字段；
+    # Gemini 的 REST 接口不接受顶层 stop，但支持 generationConfig.stopSequences。
+    stop_value = getattr(request, "stop", None)
+    if stop_value:
+        if isinstance(stop_value, str):
+            payload["generationConfig"]["stopSequences"] = [stop_value]
+        elif isinstance(stop_value, list):
+            payload["generationConfig"]["stopSequences"] = [str(x) for x in stop_value if x is not None]
+
     if "maxOutputTokens" not in generation_config:
         payload["generationConfig"]["maxOutputTokens"] = 32768
 
