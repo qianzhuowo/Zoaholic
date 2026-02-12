@@ -1,9 +1,7 @@
 name = "zoaholic"
 main = "worker.py"
 compatibility_flags = ["python_workers"]
-
-# 2025-02-01 是一个支持 Python 包的已知稳定兼容日期
-compatibility_date = "2025-02-01"
+compatibility_date = "2024-09-23"
 
 [assets]
 directory = "./static"
@@ -23,7 +21,7 @@ CONFIG_STORAGE = "db"
 D1_BINDING = "DB"
 
 [[d1_databases]]
-# 你在 Cloudflare 控制台创建的 D1 binding 名称
+# 你在 Cloudflare 控制台创建 of D1 binding 名称
 binding = "DB"
 # Wrangler 环境中 D1 数据库名（示例）
 database_name = "zoaholic"
