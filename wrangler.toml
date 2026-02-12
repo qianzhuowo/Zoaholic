@@ -1,10 +1,9 @@
 name = "zoaholic"
 main = "worker.py"
 compatibility_flags = ["python_workers"]
-# 使用较新的 compatibility_date，确保 Python Workers 新能力（含依赖解析）可用。
-# 旧日期可能触发 Cloudflare API 10021：
-# "You cannot yet deploy Python Workers that depend on packages defined in requirements.txt"
-compatibility_date = "2026-02-12"
+
+# 2025-02-01 是一个支持 Python 包的已知稳定兼容日期
+compatibility_date = "2025-02-01"
 
 [assets]
 directory = "./static"

@@ -1,7 +1,15 @@
 # Python virtual environments
-.venv/
-venv/
-ENV/
+.venv
+.venv/**
+**/.venv/**
+venv
+venv/**
+**/venv/**
+ENV
+ENV/**
+**/ENV/**
+site-packages/
+**/site-packages/**
 __pycache__/
 *.pyc
 *.pyd
@@ -12,7 +20,9 @@ frontend/
 
 # Tests & docs
 test/
+test/**
 core/test/
+core/test/**
 docs/
 
 # Git & CI
@@ -31,6 +41,8 @@ docker-compose-*.yml
 .idea/
 .DS_Store
 Thumbs.db
+requirements.txt
+pyproject.toml
 
 # Database files
 *.db
@@ -57,6 +69,7 @@ coverage/
 htmlcov/
 uv.lock
 *.pex
+wrangler_dryrun*
 LICENSE
 README.md
 README_EN.md
