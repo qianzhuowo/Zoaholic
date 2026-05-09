@@ -10,6 +10,7 @@ import os
 import json
 
 from core.env import env_bool
+from core.json_utils import json_loads
 import uuid
 import asyncio
 import contextvars
@@ -25,10 +26,10 @@ from starlette.types import ASGIApp, Receive, Send, Scope, Message
 
 from core.log_config import logger
 from core.models import ModerationRequest, UnifiedRequest
+from core.metrics import on_request_start, on_request_end
 from core.stats import update_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
-from core.auth_errors import AUTH_API_KEY_INVALID, get_auth_error_message
 from utils import safe_get
 from db import DISABLE_DATABASE
 
@@ -134,6 +135,28 @@ class StatsMiddleware:
                 return True
         return False
 
+    @staticmethod
+    def _get_client_ip(scope: Scope, headers: list) -> str:
+        """
+        获取客户端真实 IP。
+        优先级：X-Forwarded-For > X-Real-IP > scope["client"]
+        """
+        headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
+
+        # X-Forwarded-For: client, proxy1, proxy2 —— 取第一个
+        forwarded_for = headers_dict.get("x-forwarded-for")
+        if forwarded_for:
+            real_ip = forwarded_for.split(",")[0].strip()
+            if real_ip:
+                return real_ip
+
+        real_ip_header = headers_dict.get("x-real-ip")
+        if real_ip_header:
+            return real_ip_header.strip()
+
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
     def _normalize_endpoint(self, method: str, path: str) -> str:
         """归一化端点路径，将带模型名的路径转换为模板格式"""
         # 处理 Gemini 风格路径: /v1beta/models/{model}:generateContent
@@ -181,6 +204,10 @@ class StatsMiddleware:
         start_time = time()
         headers = scope.get("headers", [])
 
+        # ── 运行时指标：标记请求开始 ──
+        _metrics_model: Optional[str] = None
+        _metrics_tracked = False
+
         # 方言端点跳过中间件认证，但仍需初始化基础上下文
         token = None
         api_index = None
@@ -195,11 +222,7 @@ class StatsMiddleware:
             # 标准端点：执行完整认证
             token = get_api_key_from_headers(headers)
             if not token:
-                response = openai_error_response(
-                    get_auth_error_message(AUTH_API_KEY_INVALID),
-                    403,
-                    code=AUTH_API_KEY_INVALID,
-                )
+                response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)
                 return
 
@@ -235,17 +258,12 @@ class StatsMiddleware:
                         await response(scope, receive, send)
                         return
             else:
-                response = openai_error_response(
-                    get_auth_error_message(AUTH_API_KEY_INVALID),
-                    403,
-                    code=AUTH_API_KEY_INVALID,
-                )
+                response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)
                 return
 
         # 获取 client IP
-        client = scope.get("client")
-        client_ip = client[0] if client else "unknown"
+        client_ip = self._get_client_ip(scope, headers)
 
         # 获取用户key相关信息
         api_key_name = safe_get(config, "api_keys", api_index, "name", default=None)
@@ -271,6 +289,9 @@ class StatsMiddleware:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            # Prompt Caching 字段随请求上下文初始化为 0，目的是让没有缓存信息的请求也能稳定写入新列。
+            "cached_tokens": 0,
+            "cache_creation_tokens": 0,
             # 扩展日志字段
             "provider_id": None,
             "provider_key_index": None,
@@ -278,6 +299,13 @@ class StatsMiddleware:
             "retry_path": None,
             "request_headers": None,
             "request_body": None,
+            # 修改原因：日志上下文需要完整承载上下游请求与响应的原始数据字段。
+            # 修改方式：初始化上游请求头、上游请求体、上游响应头和上游响应体字段为 None。
+            # 目的：让后续采集逻辑和数据库写入使用稳定的字段集合。
+            "upstream_request_headers": None,
+            "upstream_request_body": None,
+            "upstream_response_headers": None,
+            "upstream_response_body": None,
             "response_body": None,
             "raw_data_expires_at": None,
         }
@@ -304,13 +332,13 @@ class StatsMiddleware:
             if body_bytes:
                 try:
                     # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-                    parsed_body = await asyncio.to_thread(json.loads, body_bytes)
+                    parsed_body = json_loads(body_bytes)
                 except json.JSONDecodeError:
                     parsed_body = None
 
-        # 获取原始数据保留时间配置（小时），默认为1；设为0表示不保存
+        # 获取原始数据保留时间配置（小时），默认为24小时
         raw_data_retention_hours = safe_get(
-            config, "preferences", "log_raw_data_retention_hours", default=1
+            config, "preferences", "log_raw_data_retention_hours", default=24
         )
         
         # 如果配置了保留时间，保存请求头和请求体
@@ -354,14 +382,11 @@ class StatsMiddleware:
                     model = request_model.model
                     current_info["model"] = model
 
-                    final_api_key = app.state.api_list[api_index]
-                    try:
-                        # ApiKeyRateLimitRegistry 会自动按需创建限流器
-                        await app.state.user_api_keys_rate_limit[final_api_key].next(model)
-                    except Exception:
-                        response = openai_error_response("Too many requests", 429)
-                        await response(scope, receive_wrapper, send)
-                        return
+                    # ── 运行时指标：带模型名开始追踪 ──
+                    _metrics_model = model
+                    on_request_start(model=_metrics_model)
+                    _metrics_tracked = True
+
 
                     moderated_content = None
                     if request_model.request_type == "chat":
@@ -436,6 +461,14 @@ class StatsMiddleware:
             response = openai_error_response(f"Internal server error: {str(e)}", 500)
             await response(scope, receive_wrapper, send)
         finally:
+            # ── 运行时指标：标记请求结束 ──
+            if not _metrics_tracked:
+                # 未进入 UnifiedRequest 解析的请求也要追踪
+                on_request_start(model=None)
+                _metrics_tracked = True
+            is_success = response_started and 200 <= response_status < 500
+            on_request_end(model=_metrics_model, success=is_success)
+
             request_info.reset(current_request_info)
 
     async def _moderate_content(
@@ -459,5 +492,5 @@ class StatsMiddleware:
                 moderation_result += chunk
 
         # 解码并解析 JSON
-        moderation_data = json.loads(moderation_result.decode("utf-8"))
+        moderation_data = json_loads(moderation_result)
         return moderation_data

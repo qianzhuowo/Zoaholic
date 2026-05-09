@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
-  Folder, Clock, CheckCircle2, AlertCircle, AlertTriangle,
-  Wand2, Wallet, Brain, Download, Check, CopyCheck
+  Folder, CheckCircle2, AlertCircle, AlertTriangle,
+  Wand2, Wallet, Brain, Download, Check, Ban
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { RateLimitEditor } from '../components/RateLimitEditor';
 
 // ========== Types ==========
 interface ApiKeyData {
@@ -20,6 +20,10 @@ interface ApiKeyData {
   preferences?: {
     credits?: number;
     created_at?: string;
+    rate_limit?: string;
+    name?: string;
+    group?: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [key: string]: any;
   };
 }
@@ -48,11 +52,16 @@ export default function Admin() {
   const [formGroups, setFormGroups] = useState<string[]>(['default']);
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
-  const [formRateLimit, setFormRateLimit] = useState<string | Record<string, string> | undefined>(undefined);
+  const [formRateLimit, setFormRateLimit] = useState('');
+  const [formModelRateLimits, setFormModelRateLimits] = useState<{model: string; rate: string}[]>([]);
+  const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
+  const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
+  const [excludedChannelInput, setExcludedChannelInput] = useState('');
+  const [excludedModelInput, setExcludedModelInput] = useState('');
 
   // Credits Dialog
   const [isCreditsOpen, setIsCreditsOpen] = useState(false);
@@ -92,13 +101,18 @@ export default function Admin() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchData(); }, []);
+
+
 
   // ========== Sheet Handlers ==========
   const openSheet = (index: number | null = null, copyFrom: ApiKeyData | null = null) => {
     setEditingIndex(index);
     setGroupInput('');
     setModelInput('');
+    setExcludedChannelInput('');
+    setExcludedModelInput('');
 
     let source: ApiKeyData | null = null;
     if (copyFrom) {
@@ -127,7 +141,20 @@ export default function Admin() {
 
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
-      setFormRateLimit(source.preferences?.rate_limit);
+      // rate_limit: string | dict
+      const rl = source.preferences?.rate_limit;
+      if (rl && typeof rl === 'object') {
+        setFormRateLimit((rl as any).default || '');
+        setFormModelRateLimits(Object.entries(rl).filter(([k]) => k !== 'default').map(([model, rate]) => ({ model, rate: String(rate) })));
+      } else {
+        setFormRateLimit(typeof rl === 'string' ? rl : '');
+        setFormModelRateLimits([]);
+      }
+      // 黑名单
+      const ec = source.preferences?.excluded_channels;
+      setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
+      const em = source.preferences?.excluded_models;
+      setFormExcludedModels(Array.isArray(em) ? [...em] : (typeof em === 'string' && em.trim() ? em.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
     } else {
       setFormApi('');
       setFormName('');
@@ -135,7 +162,10 @@ export default function Admin() {
       setFormGroups(['default']);
       setFormModels([]);
       setFormCredits('');
-      setFormRateLimit(undefined);
+      setFormRateLimit('');
+      setFormModelRateLimits([]);
+      setFormExcludedChannels([]);
+      setFormExcludedModels([]);
     }
 
     setIsSheetOpen(true);
@@ -151,8 +181,8 @@ export default function Admin() {
       if (data.api_key) {
         setFormApi(data.api_key);
       }
-    } catch (err) {
-      alert('生成密钥失败');
+    } catch {
+      toastError('生成密钥失败');
     }
   };
 
@@ -206,15 +236,16 @@ export default function Admin() {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        alert(`获取模型失败: ${err.detail || res.status}`);
+        toastError(err, "获取模型失败");
         return;
       }
 
       const data = await res.json();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const models = (data.models || []).map((m: any) => m.id || m).filter(Boolean);
 
       if (models.length === 0) {
-        alert('当前分组下没有可用模型');
+        toastError('当前分组下没有可用模型');
         return;
       }
 
@@ -223,8 +254,8 @@ export default function Admin() {
       const existing = new Set(formModels);
       setSelectedModels(new Set(models.filter((m: string) => existing.has(m))));
       setIsFetchModelsOpen(true);
-    } catch (err) {
-      alert('获取模型失败');
+    } catch {
+      toastError('获取模型失败');
     } finally {
       setFetchingModels(false);
     }
@@ -270,10 +301,11 @@ export default function Admin() {
   // ========== Save ==========
   const handleSave = async () => {
     if (!formApi.trim()) {
-      alert('API Key 不能为空');
+      toastWarning('API Key 不能为空');
       return;
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const target: any = { api: formApi.trim() };
 
     if (formName.trim()) target.name = formName.trim();
@@ -282,12 +314,36 @@ export default function Admin() {
     if (formModels.length > 0) target.model = formModels;
 
     // Preferences
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const prefs: any = {};
     if (formCredits.trim()) {
       const num = Number(formCredits);
-      if (!isNaN(num)) prefs.credits = num;
+      if (!isNaN(num)) {
+        prefs.credits = num;
+        // 首次设置 credits 时自动写入计费起始时间
+        const existing = editingIndex !== null ? keys[editingIndex] : null;
+        if (!existing?.preferences?.created_at) {
+          prefs.created_at = new Date().toISOString();
+        }
+      }
     }
-    if (formRateLimit) prefs.rate_limit = formRateLimit;
+    // rate_limit: 有模型规则时存 dict，否则存字符串（向后兼容）
+    const validModelLimits = formModelRateLimits.filter(r => r.model.trim() && r.rate.trim());
+    if (validModelLimits.length > 0) {
+      const rlDict: Record<string, string> = {};
+      if (formRateLimit.trim()) rlDict.default = formRateLimit.trim();
+      validModelLimits.forEach(r => { rlDict[r.model.trim()] = r.rate.trim(); });
+      prefs.rate_limit = rlDict;
+    } else if (formRateLimit.trim()) {
+      prefs.rate_limit = formRateLimit.trim();
+    }
+    // 黑名单字段始终写入 prefs（即使为空数组也写入，用于后续清空逻辑）
+    if (formExcludedChannels.length > 0) {
+      prefs.excluded_channels = formExcludedChannels;
+    }
+    if (formExcludedModels.length > 0) {
+      prefs.excluded_models = formExcludedModels;
+    }
     if (Object.keys(prefs).length > 0) target.preferences = prefs;
 
     const newKeys = [...keys];
@@ -296,16 +352,14 @@ export default function Admin() {
       const existing = keys[editingIndex];
       if (existing.preferences) {
         target.preferences = { ...existing.preferences, ...prefs };
-        if (!formCredits.trim()) {
-          delete target.preferences.credits;
-        }
-        if (!formRateLimit) {
-          delete target.preferences.rate_limit;
-        }
-        if (Object.keys(target.preferences).length === 0) {
-          delete target.preferences;
-        }
       }
+      // 黑名单字段显式处理：确保用户可以清空
+      if (!target.preferences) target.preferences = {};
+      target.preferences.excluded_channels = formExcludedChannels.length > 0 ? formExcludedChannels : undefined;
+      target.preferences.excluded_models = formExcludedModels.length > 0 ? formExcludedModels : undefined;
+      // 清理 undefined 键
+      if (target.preferences.excluded_channels === undefined) delete target.preferences.excluded_channels;
+      if (target.preferences.excluded_models === undefined) delete target.preferences.excluded_models;
       newKeys[editingIndex] = target;
     } else {
       newKeys.push(target);
@@ -322,10 +376,10 @@ export default function Admin() {
         setIsSheetOpen(false);
         fetchData();
       } else {
-        alert('保存失败');
+        toastError('保存失败');
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch {
+      toastError('网络错误');
     }
   };
 
@@ -346,10 +400,10 @@ export default function Admin() {
         setKeys(newKeys);
         fetchData();
       } else {
-        alert('删除失败');
+        toastError('删除失败');
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch {
+      toastError('网络错误');
     }
   };
 
@@ -371,10 +425,10 @@ export default function Admin() {
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(`清空失败: ${data.detail || res.status}`);
+        toastError(data, "清空失败");
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch {
+      toastError('网络错误');
     }
   };
 
@@ -388,7 +442,7 @@ export default function Admin() {
   const handleAddCredits = async () => {
     const amount = parseFloat(creditsAmount);
     if (isNaN(amount) || amount <= 0) {
-      alert('请输入大于 0 的有效数字');
+      toastWarning('请输入大于 0 的有效数字');
       return;
     }
 
@@ -402,10 +456,10 @@ export default function Admin() {
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(`充值失败: ${data.detail || res.status}`);
+        toastError(data, "充值失败");
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch {
+      toastError('网络错误');
     }
   };
 
@@ -436,31 +490,79 @@ export default function Admin() {
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       {/* Header */}
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-foreground">API 密钥管理</h1>
-          <p className="text-muted-foreground mt-1">管理调用 Zoaholic 网关的下游 API Key、额度与权限</p>
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground">API 密钥管理</h1>
+          <p className="text-muted-foreground mt-1 text-sm sm:text-base">管理调用 Zoaholic 网关的下游 API Key、额度与权限</p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={fetchData} className="p-2 text-muted-foreground hover:text-foreground bg-card border border-border rounded-lg">
+        <div className="flex gap-2 w-full sm:w-auto">
+          <button onClick={fetchData} className="p-2 text-muted-foreground hover:text-foreground bg-card border border-border rounded-lg flex-shrink-0">
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
           <button
             onClick={handleClearAllKeys}
             disabled={keys.length === 0}
-            className="px-3 py-2 text-sm font-medium bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-500/20 rounded-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-3 py-2 text-sm font-medium bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-500/20 rounded-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-1 sm:flex-none justify-center"
             title="一键清空全部 API Keys"
           >
-            <Trash2 className="w-4 h-4" /> 清空全部
+            <Trash2 className="w-4 h-4" /> <span className="hidden sm:inline">清空全部</span><span className="sm:hidden">清空</span>
           </button>
-          <button onClick={() => openSheet()} className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium">
-            <Plus className="w-4 h-4" /> 新增 API Key
+          <button onClick={() => openSheet()} className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium flex-1 sm:flex-none justify-center">
+            <Plus className="w-4 h-4" /> <span className="hidden sm:inline">新增 API Key</span><span className="sm:hidden">新增</span>
           </button>
         </div>
       </div>
 
       {/* Table */}
-      <div className="bg-card border border-border rounded-xl overflow-hidden">
+      {/* Mobile Card List */}
+      <div className="md:hidden space-y-4">
+        {loading && keys.length === 0 ? (
+          <div className="p-8 text-center text-muted-foreground">加载密钥数据...</div>
+        ) : keys.length === 0 ? (
+          <div className="p-12 text-center text-muted-foreground">
+            <Key className="w-12 h-12 mb-3 opacity-50 mx-auto" />
+            <h3 className="text-lg font-medium text-foreground">暂无 API 密钥</h3>
+            <p className="text-sm mt-1 mb-4">创建您的第一个密钥以允许客户端接入</p>
+            <button onClick={() => openSheet()} className="text-primary hover:underline text-sm font-medium">+ 新增 API Key</button>
+          </div>
+        ) : (
+          keys.map((keyObj, idx) => {
+            const status = getStatusInfo(keyObj.api);
+            const credits = getCreditsInfo(keyObj.api);
+            const name = keyObj.name || keyObj.preferences?.name || '未命名密钥';
+            const groups = keyObj.groups || (keyObj.group ? [keyObj.group] : ['default']);
+            return (
+              <div key={idx} className="bg-card border border-border rounded-xl p-4">
+                <div className="flex items-start justify-between mb-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-foreground truncate">{name}</div>
+                    <div className="text-xs text-muted-foreground font-mono mt-1 flex items-center gap-1.5">
+                      <Key className="w-3 h-3 flex-shrink-0" />
+                      {keyObj.api.slice(0, 7)}...{keyObj.api.slice(-4)}
+                      <button onClick={() => copyToClipboard(keyObj.api)} className="text-muted-foreground/60 hover:text-foreground"><Copy className="w-3 h-3" /></button>
+                    </div>
+                  </div>
+                  <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium flex-shrink-0 ${status.cls}`}>{status.icon} {status.label}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
+                  <span className={`px-2 py-0.5 rounded font-medium ${keyObj.role === 'admin' ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400' : 'bg-muted text-muted-foreground'}`}>{keyObj.role || 'user'}</span>
+                  {groups.map(g => (<span key={g} className="flex items-center gap-1 bg-muted text-foreground px-1.5 py-0.5 rounded"><Folder className="w-3 h-3" />{g}</span>))}
+                  <span className="text-muted-foreground">{credits.text}</span>
+                </div>
+                <div className="flex items-center justify-end gap-1 pt-3 border-t border-border">
+                  <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值"><Wallet className="w-4 h-4" /></button>
+                  <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制"><Copy className="w-4 h-4" /></button>
+                  <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑"><Edit className="w-4 h-4" /></button>
+                  <button onClick={() => handleDelete(idx)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md" title="删除"><Trash2 className="w-4 h-4" /></button>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Desktop Table */}
+      <div className="hidden md:block bg-card border border-border rounded-xl overflow-hidden">
         {loading && keys.length === 0 ? (
           <div className="p-12 flex flex-col items-center justify-center text-muted-foreground">
             <RefreshCw className="w-8 h-8 animate-spin mb-3" />
@@ -510,6 +612,11 @@ export default function Admin() {
                       </div>
                       {state?.created_at && (
                         <div className="text-xs text-muted-foreground/60 mt-1">创建: {state.created_at}</div>
+                      )}
+                      {keyObj.preferences?.rate_limit && (
+                        <div className="text-[10px] text-muted-foreground/50 mt-0.5">限流: {typeof keyObj.preferences.rate_limit === 'object'
+                          ? `${(keyObj.preferences.rate_limit as any).default || '无全局'} + ${Object.keys(keyObj.preferences.rate_limit).filter(k => k !== 'default').length} 条模型规则`
+                          : keyObj.preferences.rate_limit}</div>
                       )}
                     </td>
                     <td className="px-6 py-4">
@@ -564,7 +671,7 @@ export default function Admin() {
       <Dialog.Root open={isSheetOpen} onOpenChange={setIsSheetOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-          <Dialog.Content className="fixed right-0 top-0 h-full w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
+          <Dialog.Content className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
             <div className="p-5 border-b border-border flex justify-between items-center bg-muted/30">
               <Dialog.Title className="text-lg font-bold text-foreground flex items-center gap-2">
                 <Key className="w-5 h-5 text-primary" />
@@ -595,14 +702,14 @@ export default function Admin() {
                   <div className="flex gap-2">
                     <input
                       type="text" value={formApi} onChange={e => setFormApi(e.target.value)}
-                      placeholder="sk-xxx... / zk-xxx..."
+                      placeholder="zk-xxx..."
                       className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                     />
                     <button onClick={generateKey} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg flex items-center gap-1.5 text-sm">
                       <Wand2 className="w-4 h-4" /> 生成
                     </button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">建议使用以 sk- 或 zk- 开头的随机字符串（默认生成仍为 sk-）</p>
+                  <p className="text-xs text-muted-foreground mt-1">建议使用以 zk- 开头的随机字符串</p>
                 </div>
 
                 <div>
@@ -641,7 +748,7 @@ export default function Admin() {
               {/* Quota Section */}
               <section className="space-y-4">
                 <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
-                  <Wallet className="w-4 h-4 text-emerald-500" /> 额度与模型
+                  <Wallet className="w-4 h-4 text-emerald-500" /> 额度与限流
                 </div>
 
                 <div>
@@ -654,18 +761,197 @@ export default function Admin() {
                   <p className="text-xs text-muted-foreground mt-1">与统计模块配合: credits - total_cost = 剩余余额</p>
                 </div>
 
-                <RateLimitEditor
-                  value={formRateLimit}
-                  onChange={setFormRateLimit}
-                  title="下游 API Key 专属 Rate Limit"
-                  description="支持设置默认限流规则以及按模型覆盖的限流。模型作用域支持精确名称或子串匹配；留空则不写入该 Key 的专属限流配置。"
-                  allowModelScopes
-                />
+                <div>
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">限流规则 (Rate Limit)</label>
+                  <input
+                    type="text" value={formRateLimit} onChange={e => setFormRateLimit(e.target.value)}
+                    placeholder="例如: 60/min, 1000/day"
+                    className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">全局限速：此 Key 所有模型共享的总量上限。留空使用全局默认。</p>
 
-                <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-xs text-muted-foreground">
-                  建议：默认作用域放通用阈值，模型作用域可单独压低高成本模型（如 gpt-4o / claude-3-7）。
+                  {/* 模型专属限速 */}
+                  <div className="mt-3">
+                    <div
+                      className="flex items-center gap-1.5 cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => {
+                        if (formModelRateLimits.length === 0) setFormModelRateLimits([{ model: '', rate: '' }]);
+                        else setFormModelRateLimits([]);
+                      }}
+                    >
+                      <span className="text-[10px]">{formModelRateLimits.length > 0 ? '▾' : '▸'}</span>
+                      模型专属限速{formModelRateLimits.length > 0 ? ` (${formModelRateLimits.filter(r => r.model.trim()).length})` : ''}
+                    </div>
+                    {formModelRateLimits.length > 0 && (
+                      <div className="mt-2 space-y-2">
+                        {formModelRateLimits.map((entry, idx) => (
+                          <div key={idx} className="flex gap-2 items-center">
+                            <input
+                              value={entry.model}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], model: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="模型名（支持模糊匹配）"
+                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <input
+                              value={entry.rate}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], rate: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="10/min"
+                              className="w-28 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <button
+                              onClick={() => setFormModelRateLimits(formModelRateLimits.filter((_, i) => i !== idx))}
+                              className="text-muted-foreground hover:text-destructive transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          onClick={() => setFormModelRateLimits([...formModelRateLimits, { model: '', rate: '' }])}
+                          className="text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+                        >
+                          <Plus className="w-3 h-3" /> 添加规则
+                        </button>
+                        <p className="text-[10px] text-muted-foreground">模型名支持模糊匹配（如 "claude" 匹配所有 claude 模型）。专属规则只计该模型请求数，全局规则汇总所有模型。</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </section>
+
+              {/* Access Control Section */}
+              <section className="space-y-4">
+                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
+                  <Ban className="w-4 h-4 text-red-500" /> 访问控制
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除渠道</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedChannels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除渠道</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedChannels.map((item, idx) => (
+                          <span key={idx} className="bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedChannels(formExcludedChannels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludedChannelInput}
+                      onChange={e => setExcludedChannelInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                            setExcludedChannelInput('');
+                          }
+                        }
+                      }}
+                      placeholder="输入渠道名，逗号分隔"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button
+                      onClick={() => {
+                        const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                          setExcludedChannelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">命中后将直接排除整个渠道。</p>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除模型</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedModels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除模型</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedModels.map((item, idx) => (
+                          <span key={idx} className="bg-orange-500/10 border border-orange-500/30 text-orange-600 dark:text-orange-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedModels(formExcludedModels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludedModelInput}
+                      onChange={e => setExcludedModelInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                            setExcludedModelInput('');
+                          }
+                        }
+                      }}
+                      placeholder="输入模型名、模型前缀* 或 渠道名/模型名"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button
+                      onClick={() => {
+                        const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                          setExcludedModelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    支持三种格式：
+                    <code className="bg-muted px-1 rounded">模型名</code>
+                    、<code className="bg-muted px-1 rounded">模型名前缀*</code>
+                    、<code className="bg-muted px-1 rounded">渠道名/模型名</code>
+                    。渠道名/模型名同样支持 <code className="bg-muted px-1 rounded">*</code> 前缀通配。
+                  </p>
+                </div>
+              </section>
+
 
               {/* Models Section */}
               <section className="space-y-4">
@@ -740,7 +1026,7 @@ export default function Admin() {
       <Dialog.Root open={isFetchModelsOpen} onOpenChange={setIsFetchModelsOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] max-h-[80vh] bg-background border border-border rounded-xl shadow-2xl z-50 flex flex-col">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] max-w-[95vw] max-h-[80vh] bg-background border border-border rounded-xl shadow-2xl z-50 flex flex-col">
             <div className="p-5 border-b border-border">
               <Dialog.Title className="text-lg font-bold text-foreground">选择模型</Dialog.Title>
               <p className="text-sm text-muted-foreground mt-1">当前分组: {formGroups.join(', ')}</p>
@@ -801,7 +1087,7 @@ export default function Admin() {
       <Dialog.Root open={isCreditsOpen} onOpenChange={setIsCreditsOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[400px] bg-background border border-border rounded-xl shadow-2xl z-50 p-6">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[400px] max-w-[95vw] bg-background border border-border rounded-xl shadow-2xl z-50 p-6">
             <Dialog.Title className="text-lg font-bold text-foreground flex items-center gap-2 mb-4">
               <Wallet className="w-5 h-5 text-emerald-500" /> 为 API Key 添加额度
             </Dialog.Title>

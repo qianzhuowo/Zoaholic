@@ -1,5 +1,4 @@
 import os
-import errno
 import json
 import httpx
 import asyncio
@@ -14,16 +13,18 @@ from ruamel.yaml import YAML, YAMLError
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, func, case
-from db import async_session_scope, ChannelStat, AppConfig, DISABLE_DATABASE, DB_TYPE, d1_client
+from db import async_session_scope, ChannelStat, RequestStat, AppConfig, DISABLE_DATABASE, DB_TYPE, d1_client
 from core.env import env_bool
 
 from core.log_config import logger
 from core.utils import (
     safe_get,
     get_model_dict,
+    is_local_api_key,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
+from core.json_utils import json_dumps_text, json_loads
 
 class InMemoryRateLimiter:
     def __init__(self):
@@ -60,99 +61,6 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_YAML_PATH = os.path.abspath(os.getenv("API_YAML_PATH") or os.path.join(_BASE_DIR, "api.yaml"))
 yaml_error_message = None
 
-_API_YAML_FILE_CANDIDATES = {"api.yaml", "api.yml"}
-
-LOCAL_API_KEY_PREFIXES = ("sk-", "zk-")
-
-
-def is_local_api_key(value: Optional[str]) -> bool:
-    """判断是否为 Zoaholic 本地聚合器 API Key（兼容 sk-/zk- 前缀）。"""
-
-    if not isinstance(value, str):
-        return False
-    return value.startswith(LOCAL_API_KEY_PREFIXES)
-
-
-def _looks_like_docker_miscreated_api_yaml_dir(path: str) -> bool:
-    """判断目标路径是否像 Docker 单文件挂载误创建出来的 api.yaml 目录。"""
-
-    if not os.path.isdir(path):
-        return False
-    return os.path.basename(path).lower() in _API_YAML_FILE_CANDIDATES
-
-
-def _cleanup_miscreated_api_yaml_dir(path: str) -> bool:
-    """尽量安全地清理 Docker 误创建的空目录。
-
-    仅当满足以下条件时才自动移除：
-    - 目标路径当前是目录
-    - 目录名是 api.yaml / api.yml
-    - 目录为空
-    """
-
-    if not _looks_like_docker_miscreated_api_yaml_dir(path):
-        return False
-
-    try:
-        with os.scandir(path) as entries:
-            if any(entries):
-                return False
-    except OSError:
-        return False
-
-    os.rmdir(path)
-    logger.warning(
-        "Detected empty directory at API_YAML_PATH and removed it automatically. "
-        "This is usually caused by Docker single-file bind mount when the host file is missing. path=%s",
-        path,
-    )
-    return True
-
-
-def _ensure_api_yaml_path_ready(*, for_write: bool) -> str:
-    """校验 api.yaml 路径；在安全条件下清理 Docker 误创建的空目录。"""
-
-    target_path = os.path.abspath(API_YAML_PATH)
-    target_dir = os.path.dirname(target_path) or "."
-
-    if for_write:
-        os.makedirs(target_dir, exist_ok=True)
-
-    if os.path.isdir(target_path):
-        cleaned = False
-        try:
-            cleaned = _cleanup_miscreated_api_yaml_dir(target_path)
-        except OSError as e:
-            raise RuntimeError(
-                f"API_YAML_PATH '{target_path}' is a directory and could not be cleaned automatically: {e}"
-            ) from e
-
-        if not cleaned:
-            raise IsADirectoryError(
-                f"API_YAML_PATH '{target_path}' is a directory, not a file. "
-                "This is commonly caused by Docker single-file bind mount when the host-side file is missing. "
-                "Please replace it with a real file, switch to CONFIG_STORAGE=db, or seed config via CONFIG_YAML/CONFIG_URL."
-            )
-
-    return target_path
-
-
-def _should_fallback_to_direct_api_yaml_write(exc: OSError) -> bool:
-    """判断原子替换失败后是否适合回退为直接覆盖写入。"""
-
-    err_no = getattr(exc, "errno", None)
-    err_msg = str(exc).lower()
-    return err_no in {errno.EBUSY, errno.EPERM, errno.EACCES} or "device or resource busy" in err_msg
-
-
-def _write_yaml_text_to_path(path: str, processed_data: dict) -> None:
-    """直接覆盖写入 YAML 文件，并尽量确保落盘。"""
-
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(processed_data, f)
-        f.flush()
-        os.fsync(f.fileno())
-
 
 def _sanitize_config_for_persistence(config_data: dict) -> dict:
     """清理配置中的运行时字段，返回可持久化的 dict。
@@ -164,6 +72,12 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
     import copy
 
     processed_data = copy.deepcopy(config_data or {})
+
+    # 过滤掉子渠道展开生成的 provider（运行时产物，不持久化）
+    processed_data['providers'] = [
+        p for p in (processed_data.get('providers') or [])
+        if not p.get('_is_sub_channel')
+    ]
 
     for provider in processed_data.get("providers", []) or []:
         keys_to_remove = [k for k in list(provider.keys()) if str(k).startswith("_")]
@@ -351,16 +265,26 @@ def _quote_colon_strings(obj):
 def save_api_yaml(config_data):
     """将配置持久化到 api.yaml。
 
-    优先使用“临时文件 + os.replace”原子写入；若 Docker 单文件挂载导致 replace 失败，
-    自动回退为直接覆盖写入，避免常见的 "Device or resource busy" 报错。
+    写入策略：
+    1. 优先原子写入（临时文件 + os.replace），避免写入中断导致文件损坏。
+    2. 若 os.replace 失败（常见于 Docker 单文件挂载，挂载点不可被 rename 替换，
+       报 Errno 16 Device or resource busy），自动回退为直接写入目标文件。
+    3. 若目标路径是目录，则直接报错，并提示用户修正挂载方式。
     """
 
     import copy
+    import errno
     import tempfile
 
     processed_data = copy.deepcopy(config_data)
 
-    # 清理运行时字段（以 _ 开头的字段不应该被保存到配置文件）
+    # 过滤掉子渠道展开生成的 provider（它们是运行时产物，不持久化）
+    processed_data['providers'] = [
+        p for p in processed_data.get('providers', [])
+        if not p.get('_is_sub_channel')
+    ]
+
+    # 清理运行时字段（以 _ 开头的字段不写入配置文件）
     for provider in processed_data.get('providers', []):
         keys_to_remove = [k for k in list(provider.keys()) if k.startswith('_')]
         for k in keys_to_remove:
@@ -373,8 +297,17 @@ def save_api_yaml(config_data):
 
     processed_data = _quote_colon_strings(processed_data)
 
-    target_path = _ensure_api_yaml_path_ready(for_write=True)
+    target_path = os.path.abspath(API_YAML_PATH)
     target_dir = os.path.dirname(target_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+
+    if os.path.isdir(target_path):
+        raise RuntimeError(
+            f"Configured api.yaml path '{target_path}' is a directory, not a file. "
+            f"This usually happens when Docker bind-mounts a missing host path as a directory. "
+            f"For Docker, prefer CONFIG_STORAGE=db with a persistent /home/data volume, "
+            f"or mount a directory and set API_YAML_PATH to a file inside it."
+        )
 
     temp_path = None
     try:
@@ -386,26 +319,164 @@ def save_api_yaml(config_data):
 
         try:
             os.replace(temp_path, target_path)
+            temp_path = None
+            return
         except OSError as e:
-            if not _should_fallback_to_direct_api_yaml_write(e):
+            replace_errno = getattr(e, "errno", None)
+            if replace_errno not in {errno.EBUSY, errno.EXDEV, errno.EPERM, errno.EACCES}:
                 raise
 
             logger.warning(
-                "Atomic replace for api.yaml failed, falling back to direct write. path=%s error=%s",
-                target_path,
-                e,
+                f"Atomic replace unavailable for '{target_path}', falling back to direct write. "
+                f"This is common with Docker single-file bind mounts. err={e}"
             )
-            _write_yaml_text_to_path(target_path, processed_data)
+
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            temp_path = None
+
+        with open(target_path, "w", encoding="utf-8") as f:
+            yaml.dump(processed_data, f)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         if temp_path and os.path.exists(temp_path):
             try:
                 os.unlink(temp_path)
-            except Exception:
+            except OSError:
                 pass
         raise RuntimeError(f"Failed to save api.yaml to '{target_path}': {e}") from e
 
+
+# 需要去除首尾空格的 provider 字符串字段
+_PROVIDER_STRIP_FIELDS = (
+    "provider", "base_url", "engine", "model_prefix",
+    "project_id", "client_email", "private_key",
+    "cf_account_id", "aws_access_key", "aws_secret_key",
+)
+
+
+def _strip_provider_fields(provider: dict) -> None:
+    """去除 provider 配置中字符串字段的首尾空格，防止多余空白导致请求异常。"""
+    for field in _PROVIDER_STRIP_FIELDS:
+        val = provider.get(field)
+        if isinstance(val, str):
+            provider[field] = val.strip()
+
+    # 去除模型名称的首尾空格
+    models = provider.get("model")
+    if isinstance(models, list):
+        stripped = []
+        for m in models:
+            if isinstance(m, str):
+                stripped.append(m.strip())
+            elif isinstance(m, dict):
+                stripped.append(
+                    {str(k).strip(): str(v).strip() for k, v in m.items()}
+                )
+            else:
+                stripped.append(m)
+        provider["model"] = stripped
+
+    # 去除 API key 的首尾空格
+    api_val = provider.get("api")
+    if isinstance(api_val, str):
+        provider["api"] = api_val.strip()
+    elif isinstance(api_val, list):
+        provider["api"] = [
+            str(k).strip() if isinstance(k, (str, int)) else k
+            for k in api_val
+        ]
+
+
+def _expand_sub_channels(providers: list) -> list:
+    """展开子渠道：将 sub_channels 配置展开为独立的内部 provider。
+
+    子渠道继承主渠道的 api/base_url/preferences 等配置，
+    自己的配置项覆盖继承的值。展开后的 provider 在路由层表现为独立渠道。
+
+    子渠道 provider 名格式：{主渠道名}:{子渠道engine}
+    """
+    expanded = []
+    for provider in providers:
+        # 主渠道本身始终保留（即使有 sub_channels）
+        expanded.append(provider)
+
+        sub_channels = provider.get("sub_channels")
+        if not isinstance(sub_channels, list) or not sub_channels:
+            continue
+
+        # 主渠道可继承的字段（子渠道没配的就继承）
+        parent_api = provider.get("api")
+        parent_base_url = provider.get("base_url", "")
+        parent_preferences = provider.get("preferences") or {}
+        parent_groups = provider.get("groups") or ["default"]
+        parent_enabled = provider.get("enabled", True)
+        parent_name = provider.get("provider", "")
+
+        seen_names = set()
+        for sub_idx, sub in enumerate(sub_channels):
+            if not isinstance(sub, dict):
+                continue
+            sub_engine = sub.get("engine")
+            if not sub_engine:
+                continue
+
+            # 子渠道 provider 名：主渠道名:子引擎名（重复时加序号）
+            base_name = sub.get("provider") or f"{parent_name}:{sub_engine}"
+            sub_name = base_name
+            if sub_name in seen_names:
+                sub_name = f"{base_name}:{sub_idx}"
+            seen_names.add(sub_name)
+
+            # 深合并 preferences：主渠道为底，子渠道覆盖
+            merged_prefs = {**parent_preferences}
+            sub_prefs = sub.get("preferences")
+            if isinstance(sub_prefs, dict):
+                merged_prefs.update(sub_prefs)
+
+            sub_provider = {
+                "provider": sub_name,
+                "engine": sub_engine,
+                "api": sub.get("api") or parent_api,
+                "base_url": sub.get("base_url") or parent_base_url,
+                "model": sub.get("model") or [],
+                "preferences": merged_prefs,
+                "groups": sub.get("groups") or parent_groups,
+                "enabled": sub.get("enabled") if sub.get("enabled") is not None else parent_enabled,
+                "remark": sub.get("remark") or f"[子渠道] {parent_name} → {sub_engine}",
+                # 标记为子渠道（前端/API 可用来识别）
+                "_parent_provider": parent_name,
+                "_is_sub_channel": True,
+            }
+
+            # 继承其他可选字段
+            if sub.get("model_prefix"):
+                sub_provider["model_prefix"] = sub["model_prefix"]
+            elif provider.get("model_prefix"):
+                sub_provider["model_prefix"] = provider["model_prefix"]
+
+            expanded.append(sub_provider)
+
+    return expanded
+
+
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
+    # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
+    # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
+    # 目的：避免多次保存全局设置后，子渠道在运行时 providers 中重复累积。
+    base_providers = [
+        p for p in (config_data.get('providers') or [])
+        if not (isinstance(p, dict) and p.get('_is_sub_channel'))
+    ]
+    # 展开子渠道为独立 provider（路由层无感知）
+    config_data['providers'] = _expand_sub_channels(base_providers)
+
     for index, provider in enumerate(config_data['providers']):
+        _strip_provider_fields(provider)
+
         if provider.get('project_id'):
             if "google-vertex-ai" not in provider.get("base_url", ""):
                 provider['base_url'] = 'https://aiplatform.googleapis.com/'
@@ -419,7 +490,15 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
         if provider_api:
             if isinstance(provider_api, int):
                 provider_api = str(provider_api)
-            
+
+            # 子渠道共享主渠道的 key circular list（保证 round_robin 和禁用状态一致）
+            parent_name = provider.get('_parent_provider')
+            if parent_name and parent_name in provider_api_circular_list:
+                provider_api_circular_list[provider['provider']] = provider_api_circular_list[parent_name]
+                # 跳过后面的 circular list 创建
+                provider_api = None
+
+        if provider_api:
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):
@@ -437,6 +516,15 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                         items.append(key_str)
                 return items, disabled_keys
             
+            # 保存旧实例的自动禁用状态，用于热重载后恢复
+            old_circular = provider_api_circular_list.get(provider['provider'])
+            old_auto_disabled = {}
+            old_auto_cooling = {}
+            # 注意: 此处直接读旧实例的共享状态未加锁，但热重载窗口极短且为只读快照，风险可接受
+            if old_circular and hasattr(old_circular, 'auto_disabled_info'):
+                old_auto_disabled = dict(old_circular.auto_disabled_info)
+                old_auto_cooling = {k: old_circular.cooling_until[k] for k in old_auto_disabled}
+
             if isinstance(provider_api, str):
                 items, disabled_keys = parse_api_keys([provider_api])
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
@@ -455,6 +543,19 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                     provider_name=provider['provider'],
                     disabled_keys=disabled_keys
                 )
+
+            # 恢复自动禁用状态（仅恢复新实例中仍存在的 Key）
+            if old_auto_disabled:
+                new_circular = provider_api_circular_list.get(provider['provider'])
+                if new_circular:
+                    from time import time as _time_now
+                    now = _time_now()
+                    for k, info in old_auto_disabled.items():
+                        until = old_auto_cooling.get(k, 0)
+                        if k in new_circular.items and k not in new_circular.disabled_keys:
+                            if until == float('inf') or until > now:
+                                new_circular.cooling_until[k] = until
+                                new_circular.auto_disabled_info[k] = info
 
         if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
             provider['model'] = [
@@ -491,7 +592,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
     for index, api_key in enumerate(config_data['api_keys']):
         if "api" in api_key:
-            config_data['api_keys'][index]["api"] = str(api_key["api"])
+            config_data['api_keys'][index]["api"] = str(api_key["api"]).strip()
 
         # 兼容 JSON/JSONB：把 created_at 从字符串恢复为 datetime（用于余额/账期逻辑）
         try:
@@ -531,16 +632,16 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
         # 确保api字段为字符串类型
         if "api" in api_key:
-            config_data['api_keys'][index]["api"] = str(api_key["api"])
+            config_data['api_keys'][index]["api"] = str(api_key["api"]).strip()
 
         if api_key.get('model'):
             for model in api_key.get('model'):
                 if isinstance(model, dict):
                     # 只提取模型名，忽略权重值（权重现在在渠道级别配置）
                     key = list(model.keys())[0]
-                    models.append(key)
+                    models.append(str(key).strip())
                 if isinstance(model, str):
-                    models.append(model)
+                    models.append(model.strip())
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
         else:
@@ -550,6 +651,12 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
+
+    # 修改原因：虚拟模型允许覆盖同名真实模型，但链条递归等结构性错误仍必须在启动或保存时被发现。
+    # 修改方式：在 provider 模型缓存和 API Key 模型数组都完成规范化之后执行集中校验。
+    # 目的：允许同名覆盖普通路由，同时阻止链条中出现嵌套虚拟模型。
+    from core.virtual_routing import validate_virtual_models_config
+    validate_virtual_models_config(config_data)
 
     # 管理阶段：只在显式请求保存时（save_to_file=True）才同步写回本地 api.yaml。
     if not use_config_url and save_to_file:
@@ -614,16 +721,12 @@ async def load_config(app=None):
 
     # 2) 尝试本地文件 api.yaml（旧方式）
     if conf_seed is None and config_storage in ("auto", "db", "file"):
-        target_path = API_YAML_PATH
         try:
-            target_path = _ensure_api_yaml_path_ready(for_write=False)
-            with open(target_path, 'r', encoding='utf-8') as file:
+            with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
                 conf_seed = yaml.load(file)
             if not conf_seed:
                 logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
                 conf_seed = None
-        except IsADirectoryError as e:
-            logger.error("Invalid api.yaml path: %s", e)
         except FileNotFoundError:
             if config_storage == "file":
                 logger.error("'api.yaml' not found. Please check the file path.")
@@ -633,7 +736,7 @@ async def load_config(app=None):
             yaml_error_message = "配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。"
             conf_seed = None
         except OSError as e:
-            logger.error("open '%s' failed: %s", target_path, e)
+            logger.error(f"open 'api.yaml' failed: {e}")
             conf_seed = None
 
     # 3) 尝试 CONFIG_URL
@@ -672,8 +775,8 @@ async def load_config(app=None):
         # 通过 /admin 页面或 /v1/api_config/update 完成配置，并把配置持久化到数据库。
         #
         # 支持：
-        # - ADMIN_API_KEY=sk-xxxx / zk-xxxx
-        # - ADMIN_API_KEYS=sk-xxx,zk-yyy
+        # - ADMIN_API_KEY=zk-xxxx
+        # - ADMIN_API_KEYS=zk-xxx,zk-yyy
         admin_keys_raw = (os.getenv("ADMIN_API_KEYS") or os.getenv("ADMIN_API_KEY") or "").strip()
         if admin_keys_raw:
             admin_keys = [k.strip() for k in admin_keys_raw.split(",") if k.strip()]
@@ -715,16 +818,75 @@ async def load_config(app=None):
 
     return config, api_keys_db, api_list
 
-async def ensure_string(item):
+async def ensure_string(item, as_sse: bool = True):
     if isinstance(item, (bytes, bytearray)):
         return item.decode("utf-8")
     elif isinstance(item, str):
         return item
     elif isinstance(item, dict):
-        json_str = await asyncio.to_thread(json.dumps, item)
-        return f"data: {json_str}\n\n"
+        # 大 dict（如含 base64 图片的响应）同步序列化会阻塞事件循环，
+        # 放到线程池执行，避免高并发生图时 event loop block
+        json_str = await asyncio.to_thread(json_dumps_text, item)
+        if as_sse:
+            return f"data: {json_str}\n\n"
+        return json_str
     else:
         return str(item)
+
+def has_header_case_insensitive(headers: dict, key: str) -> bool:
+    """大小写无关地检查请求头是否存在。"""
+    if not isinstance(headers, dict):
+        return False
+
+    key_lower = str(key).lower()
+    return any(str(existing_key).lower() == key_lower for existing_key in headers.keys())
+
+def _set_header_case_insensitive(headers: dict, key: str, value) -> None:
+    """大小写无关地写入请求头，避免 Content-Type/content-type 一类重复键。"""
+    if not isinstance(headers, dict):
+        return
+
+    key_str = str(key)
+    key_lower = key_str.lower()
+    target_key = None
+
+    for existing_key in headers.keys():
+        if str(existing_key).lower() == key_lower:
+            target_key = existing_key
+            break
+
+    normalized_value = ",".join(str(i) for i in value) if isinstance(value, list) else str(value)
+
+    if target_key is None:
+        headers[key_str] = normalized_value
+    else:
+        headers[target_key] = normalized_value
+
+def apply_custom_headers(headers: dict, custom_headers: dict) -> None:
+    """将渠道自定义 headers 合并到请求头中。
+
+    custom_headers 的值支持两种格式：
+    - str: 直接设置
+    - list[str]: 用逗号拼接后设置（符合 RFC 7230 §3.2.2）
+
+    示例::
+        {"anthropic-beta": ["val1", "val2"]}  →  "anthropic-beta": "val1,val2"
+        {"X-Custom": "abc"}                   →  "X-Custom": "abc"
+    """
+    if not isinstance(custom_headers, dict):
+        return
+    for k, v in custom_headers.items():
+        if v is None:
+            continue
+        # 值为 "null" 字符串时删除该 header（用于屏蔽渠道硬编码的头）
+        if isinstance(v, str) and v.strip().lower() == "null":
+            key_lower = str(k).lower()
+            for existing_key in list(headers.keys()):
+                if str(existing_key).lower() == key_lower:
+                    del headers[existing_key]
+                    break
+            continue
+        _set_header_case_insensitive(headers, k, v)
 
 def identify_audio_format(file_bytes):
     # 读取开头的字节
@@ -821,7 +983,7 @@ async def error_handling_wrapper(
         stream_end_logged = False
 
         if first_item:
-            yield await ensure_string(first_item)
+            yield await ensure_string(first_item, as_sse=stream)
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
@@ -839,7 +1001,7 @@ async def error_handling_wrapper(
                         await asyncio.sleep(timeout)
                         yield ": keepalive\n\n"
                     else:
-                        yield await ensure_string(item)
+                        yield await ensure_string(item, as_sse=stream)
                         wait_task = None
                 except asyncio.CancelledError:
                     logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
@@ -913,7 +1075,7 @@ async def error_handling_wrapper(
             # 原始逻辑：不需要心跳
             try:
                 async for item in generator:
-                    yield await ensure_string(item)
+                    yield await ensure_string(item, as_sse=stream)
                 _log_stream_end("upstream_eof")
                 stream_end_logged = True
             except asyncio.CancelledError:
@@ -1036,7 +1198,7 @@ async def error_handling_wrapper(
             # 仅当能提取到 JSON candidate 时才进行 json.loads，避免包含 event: 行的 SSE 首包导致误判
             if json_candidate is not None:
                 try:
-                    first_item_str = await asyncio.to_thread(json.loads, json_candidate)
+                    first_item_str = json_loads(json_candidate)
                 except json.JSONDecodeError:
                     logger.error(
                         f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(json_candidate)}"
@@ -1146,6 +1308,55 @@ async def error_handling_wrapper(
         logger.warning(f"provider: {channel_id:<11} empty response [{type(first_item_str)}]: {first_item_str}")
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
 
+def _append_model_info_if_missing(all_models, unique_models, model_id):
+    """向 /v1/models 返回值追加一个模型条目。"""
+    # 修改原因：真实模型和虚拟模型都需要构造同一种 OpenAI 兼容模型对象。
+    # 修改方式：集中去重并生成固定结构的 model_info。
+    # 目的：避免新增虚拟模型暴露逻辑时重复拼装字段导致行为不一致。
+    if not model_id or model_id in unique_models:
+        return
+    unique_models.add(model_id)
+    all_models.append({
+        "id": model_id,
+        "object": "model",
+        "created": 1720524448858,
+        "owned_by": "Zoaholic",
+    })
+
+
+def _append_authorized_virtual_models(all_models, unique_models, config, api_index):
+    """按当前 API Key 的 model 授权追加启用的虚拟模型。"""
+    # 修改原因：虚拟模型名需要出现在 /v1/models 中，但只能展示当前 API Key 有权限访问的条目。
+    # 修改方式：读取 preferences.virtual_models，保留 enabled 不为 false 且被 model 数组或 all 授权的虚拟名。
+    # 目的：让客户端可以发现可用虚拟模型，同时不引入新的授权机制。
+    virtual_models = safe_get(config, 'preferences', 'virtual_models', default={}) or {}
+    if not isinstance(virtual_models, dict):
+        return
+
+    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=[]) or []
+    normalized_rules = []
+    for rule in model_rules:
+        if isinstance(rule, dict) and rule:
+            rule = next(iter(rule.keys()))
+        if isinstance(rule, str):
+            normalized_rules.append(rule)
+
+    allow_all = "all" in normalized_rules
+    allowed_names = set(normalized_rules)
+
+    for virtual_name, virtual_config in virtual_models.items():
+        if not isinstance(virtual_config, dict):
+            continue
+        enabled_value = virtual_config.get("enabled", True)
+        if isinstance(enabled_value, str):
+            enabled_value = enabled_value.strip().lower() not in {"false", "0", "no", "off"}
+        if enabled_value is False:
+            continue
+        virtual_name = str(virtual_name).strip()
+        if allow_all or virtual_name in allowed_names:
+            _append_model_info_if_missing(all_models, unique_models, virtual_name)
+
+
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
@@ -1162,7 +1373,11 @@ def post_all_models(api_index, config, api_list, models_list):
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
                 # 如果模型名为 all，则返回所有模型并去重，按分组过滤
-                return get_all_models(config, allowed_groups)
+                all_models = get_all_models(config, allowed_groups)
+                unique_models = {item["id"] for item in all_models}
+                _append_authorized_virtual_models(all_models, unique_models, config, api_index)
+                all_models.sort(key=lambda x: x["id"])
+                return all_models
             if "/" in model:
                 provider = model.split("/")[0]
                 model = model.split("/")[1]
@@ -1211,6 +1426,9 @@ def post_all_models(api_index, config, api_list, models_list):
                             # 如果渠道配置了 model_prefix，只展示带前缀的模型名
                             prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
+                                # 跳过通配符标记，"*" 不是真实模型名
+                                if model_item == "*":
+                                    continue
                                 # 过滤掉作为别名映射上游的模型名
                                 if model_item in upstream_candidates:
                                     continue
@@ -1273,6 +1491,9 @@ def post_all_models(api_index, config, api_list, models_list):
                             # 如果渠道配置了 model_prefix，只展示带前缀的模型名
                             prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
+                                # 跳过通配符标记，"*" 不是真实模型名
+                                if model_item == "*":
+                                    continue
                                 # 过滤掉作为别名映射上游的模型名
                                 if model_item in upstream_candidates:
                                     continue
@@ -1293,16 +1514,17 @@ def post_all_models(api_index, config, api_list, models_list):
             if is_local_api_key(model) and model in api_list:
                 continue
 
+            virtual_models_cfg = safe_get(config, 'preferences', 'virtual_models', default={}) or {}
+            if isinstance(virtual_models_cfg, dict) and model in virtual_models_cfg:
+                # 修改原因：虚拟模型是否展示取决于 virtual_models.enabled 和 API Key 授权，不能被普通模型兜底逻辑提前加入。
+                # 修改方式：遇到已配置的虚拟模型名时跳过普通追加，统一交给 _append_authorized_virtual_models 处理。
+                # 目的：避免 disabled 的虚拟模型仍然出现在 /v1/models 中。
+                continue
+
             # 直接使用配置的模型名，不做归一化
-            if model not in unique_models:
-                unique_models.add(model)
-                model_info = {
-                    "id": model,
-                    "object": "model",
-                    "created": 1720524448858,
-                    "owned_by": "Zoaholic"
-                }
-                all_models.append(model_info)
+            _append_model_info_if_missing(all_models, unique_models, model)
+
+    _append_authorized_virtual_models(all_models, unique_models, config, api_index)
 
     # 按模型 ID 进行 Unicode 排序
     all_models.sort(key=lambda x: x["id"])
@@ -1347,6 +1569,9 @@ def get_all_models(config, allowed_groups=None):
         prefix = provider.get('model_prefix', '').strip()
         
         for model in model_dict.keys():
+            # 跳过通配符标记，"*" 不是真实模型名
+            if model == "*":
+                continue
             # 过滤掉作为别名映射上游的模型名
             if model in upstream_candidates:
                 continue
@@ -1403,8 +1628,43 @@ async def _query_channel_key_stats_d1(
                 "success_count": success_count,
                 "total_requests": total_requests,
                 "success_rate": (success_count / total_requests) if total_requests > 0 else 0,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_tokens": 0,
             }
         )
+
+    # 查询每个 Key 的 Token 用量（通过 request_id 关联 request_stats）
+    token_sql = (
+        "SELECT cs.provider_api_key, "
+        "COALESCE(SUM(rs.prompt_tokens), 0) AS total_prompt_tokens, "
+        "COALESCE(SUM(rs.completion_tokens), 0) AS total_completion_tokens, "
+        "COALESCE(SUM(rs.total_tokens), 0) AS total_tokens "
+        "FROM channel_stats cs "
+        "LEFT JOIN request_stats rs ON cs.request_id = rs.request_id "
+        "WHERE cs.provider = ? AND cs.timestamp >= ? "
+        "AND cs.provider_api_key IS NOT NULL AND cs.success = 1"
+    )
+    token_params = [provider_name, start_dt]
+    if end_dt:
+        token_sql += " AND cs.timestamp < ?"
+        token_params.append(end_dt)
+    token_sql += " GROUP BY cs.provider_api_key"
+
+    token_rows = await d1_client.query_all(token_sql, token_params)
+    token_map: Dict[str, Dict] = {}
+    for row in token_rows:
+        token_map[row.get("provider_api_key")] = {
+            "total_prompt_tokens": int(row.get("total_prompt_tokens") or 0),
+            "total_completion_tokens": int(row.get("total_completion_tokens") or 0),
+            "total_tokens": int(row.get("total_tokens") or 0),
+        }
+
+    for stat in key_stats:
+        t = token_map.get(stat["api_key"])
+        if t:
+            stat.update(t)
+
     return key_stats
 
 async def query_channel_key_stats(
@@ -1412,14 +1672,35 @@ async def query_channel_key_stats(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
 ) -> List[Dict]:
-    """Queries the ChannelStat table for API key success rates."""
+    """Queries the ChannelStat table for API key success rates.
+    
+    provider_name 支持逗号分隔的多个 provider（用于聚合主渠道+子渠道的统计）。
+    """
     if DISABLE_DATABASE:
         return []
 
+    # 解析逗号分隔的多 provider
+    provider_names = [p.strip() for p in provider_name.split(',') if p.strip()]
+
     if (DB_TYPE or "sqlite").lower() == "d1":
-        key_stats = await _query_channel_key_stats_d1(provider_name, start_dt=start_dt, end_dt=end_dt)
+        # D1: 逐个查再合并
+        all_stats: Dict[str, Dict] = {}
+        for pn in provider_names:
+            for item in await _query_channel_key_stats_d1(pn, start_dt=start_dt, end_dt=end_dt):
+                key = item["api_key"]
+                if key in all_stats:
+                    existing = all_stats[key]
+                    existing["total_requests"] += item["total_requests"]
+                    existing["success_count"] += item["success_count"]
+                    existing["total_prompt_tokens"] += item.get("total_prompt_tokens", 0)
+                    existing["total_completion_tokens"] += item.get("total_completion_tokens", 0)
+                    existing["total_tokens"] += item.get("total_tokens", 0)
+                else:
+                    all_stats[key] = {**item}
+        for v in all_stats.values():
+            v["success_rate"] = v["success_count"] / v["total_requests"] if v["total_requests"] > 0 else 0
         sorted_stats = sorted(
-            key_stats,
+            all_stats.values(),
             key=lambda item: (item["success_rate"], item["total_requests"]),
             reverse=True,
         )
@@ -1428,13 +1709,20 @@ async def query_channel_key_stats(
     async with async_session_scope() as session:
         if not start_dt:
             start_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        # 支持多 provider IN 查询
+        if len(provider_names) == 1:
+            provider_filter = ChannelStat.provider == provider_names[0]
+        else:
+            provider_filter = ChannelStat.provider.in_(provider_names)
+        
         query = (
             select(
                 ChannelStat.provider_api_key,
                 func.count().label("total_requests"),
                 func.sum(case((ChannelStat.success, 1), else_=0)).label("success_count"),
             )
-            .where(ChannelStat.provider == provider_name)
+            .where(provider_filter)
             .where(ChannelStat.timestamp >= start_dt)
             .where(ChannelStat.provider_api_key.isnot(None))
         )
@@ -1443,19 +1731,51 @@ async def query_channel_key_stats(
         query = query.group_by(ChannelStat.provider_api_key)
         result = await session.execute(query)
         stats_from_db = result.mappings().all()
+
+        # 查询每个 Key 的 Token 用量（通过 request_id 关联 request_stats）
+        token_query = (
+            select(
+                ChannelStat.provider_api_key,
+                func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("total_prompt_tokens"),
+                func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("total_completion_tokens"),
+                func.coalesce(func.sum(RequestStat.total_tokens), 0).label("total_tokens"),
+            )
+            .join(RequestStat, ChannelStat.request_id == RequestStat.request_id)
+            .where(provider_filter)
+            .where(ChannelStat.timestamp >= start_dt)
+            .where(ChannelStat.provider_api_key.isnot(None))
+            .where(ChannelStat.success == True)
+        )
+        if end_dt:
+            token_query = token_query.where(ChannelStat.timestamp < end_dt)
+        token_query = token_query.group_by(ChannelStat.provider_api_key)
+        token_result = await session.execute(token_query)
+        token_map = {
+            row.provider_api_key: {
+                "total_prompt_tokens": int(row.total_prompt_tokens or 0),
+                "total_completion_tokens": int(row.total_completion_tokens or 0),
+                "total_tokens": int(row.total_tokens or 0),
+            }
+            for row in token_result.fetchall()
+        }
+
     key_stats = []
     for row in stats_from_db:
+        api_key = row.provider_api_key
+        t = token_map.get(api_key, {})
         key_stats.append(
             {
-                "api_key": row.provider_api_key,
+                "api_key": api_key,
                 "success_count": row.success_count,
                 "total_requests": row.total_requests,
                 "success_rate": row.success_count / row.total_requests
                 if row.total_requests > 0
                 else 0,
+                "total_prompt_tokens": t.get("total_prompt_tokens", 0),
+                "total_completion_tokens": t.get("total_completion_tokens", 0),
+                "total_tokens": t.get("total_tokens", 0),
             }
         )
-    # Sort the results by success rate and total requests
     sorted_stats = sorted(
         key_stats,
         key=lambda item: (item["success_rate"], item["total_requests"]),

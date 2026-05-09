@@ -24,6 +24,11 @@ from ..utils import (
     end_of_line,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
 
@@ -44,7 +49,7 @@ async def format_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -61,13 +66,14 @@ def get_signature_key(key, date_stamp, region_name, service_name):
     return k_signing
 
 
-def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_region, host, content_type, accept_header):
+def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_region, host, content_type, accept_header, endpoint_suffix='invoke-with-response-stream'):
     import urllib.parse
-    request_body = json.dumps(request_body)
+    # 必须用 json_dumps_text 与实际发送保持一致（orjson 无空格，stdlib 有空格）
+    request_body = json_dumps_text(request_body)
     SERVICE = "bedrock"
     canonical_querystring = ''
     method = 'POST'
-    raw_path = f'/model/{model_id}/invoke-with-response-stream'
+    raw_path = f'/model/{model_id}/{endpoint_suffix}'
     canonical_uri = urllib.parse.quote(raw_path, safe='/-_.~')
     # Create a date for headers and the credential string
     t = datetime.datetime.now(timezone.utc)
@@ -80,12 +86,11 @@ def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_re
     canonical_headers = f'accept:{accept_header}\n' \
                         f'content-type:{content_type}\n' \
                         f'host:{host}\n' \
-                        f'x-amz-bedrock-accept:{accept_header}\n' \
                         f'x-amz-content-sha256:{payload_hash}\n' \
                         f'x-amz-date:{amz_date}\n'
     # 注意：头名称需要按字母顺序排序
 
-    signed_headers = 'accept;content-type;host;x-amz-bedrock-accept;x-amz-content-sha256;x-amz-date' # 按字母顺序排序
+    signed_headers = 'accept;content-type;host;x-amz-content-sha256;x-amz-date' # 按字母顺序排序
 
     canonical_request = f'{method}\n' \
                         f'{canonical_uri}\n' \
@@ -117,9 +122,22 @@ async def get_aws_payload(request, engine, provider, api_key=None):
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
     base_url = provider.get('base_url')
-    AWS_REGION = base_url.split('.')[1]
+    is_fixed_url = base_url.endswith('#')
+
+    # 从 base_url 提取 region：支持直连和反代 URL
+    import re as _re
+    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
+    if _region_match:
+        AWS_REGION = _region_match.group(1)
+    else:
+        AWS_REGION = provider.get('aws_region', 'us-east-1')
+    # 签名始终用 AWS 原始 host（反代会透传 Host header）
     HOST = f"bedrock-runtime.{AWS_REGION}.amazonaws.com"
-    url = f"{base_url}/model/{original_model}/invoke-with-response-stream"
+
+    if is_fixed_url:
+        url = base_url[:-1].rstrip('/')
+    else:
+        url = f"{base_url}/model/{original_model}/invoke-with-response-stream"
 
     messages = []
     tool_id = None
@@ -151,7 +169,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -249,18 +267,30 @@ async def get_aws_payload(request, engine, provider, api_key=None):
         payload.pop("tool_choice", None)
 
     headers = {}
-    if provider.get("aws_access_key") and provider.get("aws_secret_key"):
-        ACCEPT_HEADER = "application/vnd.amazon.bedrock.payload+json"
+    # 解析 AK/SK：优先从 api_key 参数按 "AK:SK" 格式拆分，兼容旧的 aws_access_key/aws_secret_key 字段
+    aws_ak = provider.get("aws_access_key") or ""
+    aws_sk = provider.get("aws_secret_key") or ""
+    if not aws_ak and api_key and ":" in str(api_key):
+        parts = str(api_key).split(":", 1)
+        aws_ak = parts[0].strip()
+        aws_sk = parts[1].strip()
+    if aws_ak and aws_sk:
+        ACCEPT_HEADER = "application/json"
         amz_date, payload_hash, authorization_header = await asyncio.to_thread(
-            get_signature, payload, original_model, provider.get("aws_access_key"), provider.get("aws_secret_key"), AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
+            get_signature, payload, original_model, aws_ak, aws_sk, AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
         )
         headers = {
             'Accept': ACCEPT_HEADER,
             'Content-Type': CONTENT_TYPE,
             'X-Amz-Date': amz_date,
-            'X-Amz-Bedrock-Accept': ACCEPT_HEADER,
             'X-Amz-Content-Sha256': payload_hash,
             'Authorization': authorization_header,
+        }
+        # 存储签名参数供非流式路径重新签名（塞 payload 临时字段，不污染 headers）
+        payload['_aws_signing'] = {
+            'ak': aws_ak, 'sk': aws_sk, 'region': AWS_REGION,
+            'host': HOST, 'ct': CONTENT_TYPE, 'accept': ACCEPT_HEADER,
+            'model': original_model,
         }
 
     return url, headers, payload
@@ -268,15 +298,24 @@ async def get_aws_payload(request, engine, provider, api_key=None):
 
 async def fetch_aws_response(client, url, headers, payload, model, timeout):
     """处理 AWS Bedrock 非流式响应"""
-    # 切换到非流式端点（AWS Bedrock 需要不同的签名）
+    # 切换到非流式端点并重新签名
     url = url.replace("invoke-with-response-stream", "invoke")
     
     timestamp = int(dt.timestamp(dt.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
     
-    # AWS Bedrock 非流式签名需要重新生成（此处简化，实际可能需要更完整的实现）
-    # 但根据 core/response.py 之前的硬编码，它似乎是复用 Gemini/Vertex 的解析逻辑？
-    # 实际上 AWS Bedrock 非流式返回的是一个包含 bytes 的 JSON。
+    # 从 payload 中取出签名上下文，重新计算非流式端点的签名
+    signing_ctx = payload.pop('_aws_signing', None)
+    if signing_ctx:
+        amz_date, payload_hash, authorization_header = await asyncio.to_thread(
+            get_signature, payload, signing_ctx['model'], signing_ctx['ak'], signing_ctx['sk'],
+            signing_ctx['region'], signing_ctx['host'], signing_ctx['ct'], signing_ctx['accept'],
+            endpoint_suffix='invoke'
+        )
+        headers['X-Amz-Date'] = amz_date
+        headers['X-Amz-Content-Sha256'] = payload_hash
+        headers['Authorization'] = authorization_header
+    
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     error_message = await check_response(response, "fetch_aws_response")
@@ -285,17 +324,36 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
     
-    # 解析 AWS Bedrock Claude 格式
+    # 解析 AWS Bedrock Claude 格式；Claude 的缓存字段需要计入统一 prompt_tokens 口径。
     content = safe_get(response_json, "content", 0, "text", default="")
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
-    output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cached_tokens"]
+        + cache_usage["cache_creation_tokens"]
+    )
+    output_tokens = usage.get("output_tokens", 0)
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=prompt_tokens + output_tokens,
+        **cache_usage,
+    )
+    if content:
+        mark_content_start()
     
     yield await generate_no_stream_response(
         timestamp, model, content=content, role="assistant",
         total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+        prompt_tokens=prompt_tokens, completion_tokens=output_tokens,
+        # Bedrock 非流式返回 Claude usage 时，需要把缓存字段继续传给下游输出函数。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -303,19 +361,24 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
     """处理 AWS Bedrock 流式响应"""
     from ..log_config import logger
     
+    # 流式路径不需要重签，但要清理临时字段避免发到上游
+    payload.pop('_aws_signing', None)
+    
     timestamp = int(dt.timestamp(dt.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_aws_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
-        async for line in response.aiter_text():
-            buffer += line
-            while "\r" in buffer:
-                line, buffer = buffer.split("\r", 1)
+        mark_adapter_metrics_managed()
+        # Bedrock 流式响应可能先返回 Claude usage，再在 invocationMetrics 中返回总量；缓存字段需要跨事件暂存。
+        input_tokens = 0
+        output_tokens = 0
+        cached_tokens = 0
+        cache_creation_tokens = 0
+        async for line in aiter_decoded_lines(response.aiter_bytes(), delimiter=b"\r"):
                 if not line or \
                 line.strip() == "" or \
                 line.strip().startswith(':content-type') or \
@@ -326,29 +389,151 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
                 if not json_match:
                     continue
                 try:
-                    chunk_data = await asyncio.to_thread(json.loads, json_match.group(0).lstrip('event'))
+                    chunk_data = json_loads(json_match.group(0).lstrip('event'))
                 except json.JSONDecodeError:
                     logger.error(f"DEBUG json.JSONDecodeError: {json_match.group(0).lstrip('event')!r}")
                     continue
 
                 if "bytes" in chunk_data:
                     decoded_bytes = base64.b64decode(chunk_data["bytes"])
-                    payload_chunk = await asyncio.to_thread(json.loads, decoded_bytes.decode('utf-8'))
+                    payload_chunk = json_loads(decoded_bytes)
+
+                    claude_usage = safe_get(payload_chunk, "message", "usage", default={}) or safe_get(payload_chunk, "usage", default={}) or {}
+                    if claude_usage:
+                        # Claude 流式 usage 中的 input_tokens 不含缓存部分，这里先还原为统一 prompt_tokens。
+                        _cache_usage = extract_cache_usage(claude_usage)
+                        cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                        if claude_usage.get("input_tokens") is not None:
+                            input_tokens = (
+                                (claude_usage.get("input_tokens") or 0)
+                                + cached_tokens
+                                + cache_creation_tokens
+                            )
+                        if claude_usage.get("output_tokens"):
+                            output_tokens = claude_usage.get("output_tokens", 0)
 
                     text = safe_get(payload_chunk, "delta", "text", default="")
                     if text:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, text, None, None)
                         yield sse_string
 
                     usage = safe_get(payload_chunk, "amazon-bedrock-invocationMetrics", default="")
                     if usage:
-                        input_tokens = usage.get("inputTokenCount", 0)
-                        output_tokens = usage.get("outputTokenCount", 0)
+                        raw_input_tokens = usage.get("inputTokenCount", 0)
+                        output_tokens = usage.get("outputTokenCount", output_tokens)
+                        input_tokens = input_tokens or raw_input_tokens
                         total_tokens = input_tokens + output_tokens
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, None, None,
+                            total_tokens, input_tokens, output_tokens,
+                            # Bedrock invocationMetrics 触发最终 usage chunk，需要带上先前 Claude usage 中的缓存字段。
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         yield sse_string
 
     yield "data: [DONE]" + end_of_line
+
+
+def _sign_get_request(path, aws_access_key, aws_secret_key, aws_region, host, service="bedrock"):
+    """SigV4 签名 GET 请求（无 body）"""
+    import urllib.parse
+    t = datetime.datetime.now(timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+
+    canonical_uri = urllib.parse.quote(path, safe='/-_.~')
+    payload_hash = hashlib.sha256(b'').hexdigest()  # GET 无 body
+
+    canonical_headers = (
+        f'host:{host}\n'
+        f'x-amz-content-sha256:{payload_hash}\n'
+        f'x-amz-date:{amz_date}\n'
+    )
+    signed_headers = 'host;x-amz-content-sha256;x-amz-date'
+
+    canonical_request = (
+        f'GET\n{canonical_uri}\n\n'
+        f'{canonical_headers}\n'
+        f'{signed_headers}\n'
+        f'{payload_hash}'
+    )
+
+    algorithm = 'AWS4-HMAC-SHA256'
+    credential_scope = f'{date_stamp}/{aws_region}/{service}/aws4_request'
+    string_to_sign = (
+        f'{algorithm}\n{amz_date}\n{credential_scope}\n'
+        f'{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+    )
+
+    signing_key = get_signature_key(aws_secret_key, date_stamp, aws_region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    authorization = f'{algorithm} Credential={aws_access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+
+    return {
+        'X-Amz-Date': amz_date,
+        'X-Amz-Content-Sha256': payload_hash,
+        'Authorization': authorization,
+    }
+
+
+async def fetch_aws_models(client, provider):
+    """获取 AWS Bedrock 可用模型列表（ListFoundationModels API）"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', '')
+    api_key = provider.get('api') or ''
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else ''
+
+    # 解析 AK/SK
+    aws_ak = provider.get('aws_access_key') or ''
+    aws_sk = provider.get('aws_secret_key') or ''
+    if not aws_ak and ':' in str(api_key):
+        parts = str(api_key).split(':', 1)
+        aws_ak = parts[0].strip()
+        aws_sk = parts[1].strip()
+
+    if not aws_ak or not aws_sk:
+        raise ValueError('AWS credentials not configured (api key should be AK:SK format)')
+
+    # 从 base_url 提取 region
+    # 直连: https://bedrock-runtime.us-east-1.amazonaws.com
+    # 反代: https://proxy.example.com/bedrock-runtime.us-east-1.amazonaws.com
+    import re as _re
+    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
+    if _region_match:
+        aws_region = _region_match.group(1)
+    else:
+        aws_region = provider.get('aws_region', 'us-east-1')
+
+    # ListFoundationModels 用 bedrock 而不是 bedrock-runtime
+    host = f'bedrock.{aws_region}.amazonaws.com'
+    path = '/foundation-models'
+
+    headers = _sign_get_request(path, aws_ak, aws_sk, aws_region, host, service='bedrock')
+    url = f'https://{host}{path}'
+
+    logger.debug(f'[aws] ListFoundationModels: {url}')
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    models = []
+    for m in data.get('modelSummaries', []):
+        model_id = m.get('modelId', '')
+        if model_id:
+            models.append(model_id)
+    return sorted(models)
 
 
 def register():
@@ -364,4 +549,5 @@ def register():
         request_adapter=get_aws_payload,
         response_adapter=fetch_aws_response,
         stream_adapter=fetch_aws_response_stream,
+        models_adapter=fetch_aws_models,
     )

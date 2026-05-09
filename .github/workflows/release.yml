@@ -41,7 +41,6 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          # pyproject.toml: requires-python >= 3.11
           python-version: '3.11'
 
       - name: Install build tools
@@ -53,17 +52,10 @@ jobs:
         id: resolve_version
         shell: bash
         run: |
-          # tag 触发：优先使用 tag（vX.Y.Z -> X.Y.Z）
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION=$(python - <<'PY'
-          import re
-          text = open('pyproject.toml', 'r', encoding='utf-8').read()
-          m = re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", text)
-          print(m.group(1) if m else '')
-          PY
-            )
+            VERSION=$(grep -E '^version\s*=\s*"' pyproject.toml | head -n 1 | cut -d'"' -f2)
           fi
 
           if [[ -z "$VERSION" ]]; then
@@ -78,7 +70,6 @@ jobs:
       - name: Export dependencies (requirements.txt)
         shell: bash
         run: |
-          # 从 pyproject/uv.lock 导出 requirements.txt，供 pex 使用
           uv export --format requirements-txt --no-dev -o requirements.txt
           echo "Exported requirements.txt:"
           head -n 50 requirements.txt

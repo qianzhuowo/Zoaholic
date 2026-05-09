@@ -63,7 +63,7 @@ Inherited from uni-api routing core (`core/routing.py`):
 
 ### 1) Prepare a database (PostgreSQL / Cloudflare D1 recommended for cloud)
 
-Platforms like Render/Aiven/Railway usually provide a `DATABASE_URL`.
+Cloud platforms like Aiven/Railway usually provide a `DATABASE_URL`.
 
 If you deploy on Cloudflare Workers, you can also use D1 directly:
 
@@ -79,6 +79,7 @@ Example with GHCR image (replace with your own image if you build it yourself):
 ```bash
 docker run --rm -p 8000:8000 \
   -e PORT=8000 \
+  -e CONFIG_STORAGE=db \
   -e DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require" \
   ghcr.io/qianzhuowo/zoaholic:latest
 ```
@@ -104,7 +105,7 @@ Note:
 
 ---
 
-## Cloud Deploy (Render etc.): Which env vars should I set?
+## Cloud Deploy: Which env vars should I set?
 
 Below are the most common and most error-prone environment variables for cloud deployments.
 
@@ -122,10 +123,14 @@ Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the li
 
 | Variable | Default | Notes |
 |---|---:|---|
-| `CONFIG_STORAGE` | `file` | Config source strategy: `auto\|db\|file\|url`. Default is `file` (`api.yaml` is the source of truth); for Docker / cloud deployments, explicitly prefer `db` to avoid single-file mount pitfalls. |
+| `CONFIG_STORAGE` | `file` | Config source strategy: `auto\|db\|file\|url`. Default is `file` (`api.yaml` is the source of truth); for cloud you may use `auto` (file-first + sync to DB) or `db` (DB-first). |
 | `SYNC_CONFIG_TO_FILE` | `false` | Whether to write config back to `api.yaml`. Cloud file systems are often ephemeral/readonly, keep `false`. |
 | `JWT_SECRET` | (optional) | JWT signing key for admin console. **You can skip it**: on first `/setup`, Zoaholic auto-generates and persists `admin_user.jwt_secret` in DB and reuses it after restarts. For better security, set it explicitly. |
 | `DISABLE_DATABASE` | `false` | Disable DB entirely. Cloud usually should NOT disable it (otherwise no config persistence / no stats). |
+
+If you use the repository `docker-compose.yml`, it now defaults to `CONFIG_STORAGE=db` and persists the SQLite database at `./data/stats.db`. This avoids the write problems caused by Docker single-file bind mounts for `api.yaml`.
+
+If you still want file-based config, mount a directory and point `API_YAML_PATH` to a file inside that directory. Do not bind a single host `api.yaml` directly to `/home/api.yaml`.
 
 ### Cloudflare D1 (optional)
 
@@ -145,7 +150,7 @@ Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the li
 | `CONFIG_YAML` | raw YAML | Provide seed config via env var.
 | `CONFIG_YAML_BASE64` | base64(YAML) | Recommended for multiline YAML. Loaded once and persisted into DB.
 | `CONFIG_URL` | `https://.../api.yaml` | Fetch seed config from URL and persist into DB.
-| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `sk-...` / `zk-...` | If no config sources exist, create a minimal boot config with only admin key(s).
+| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `zk-...` | If no config sources exist, create a minimal boot config with only admin key(s).
 | `DEBUG` | `true/false` | Enable debug logs.
 
 ---
@@ -168,12 +173,6 @@ Optional DB-first mode (`CONFIG_STORAGE=db`):
 
 - If DB has config: load from DB
 - If DB has no config yet: load once from `CONFIG_YAML(_BASE64)` / `CONFIG_URL` / `api.yaml` as a seed, then persist into DB
-
-- Recommended for Docker / Compose:
-  - Use `CONFIG_STORAGE=db` by default
-  - Persist only `./data:/home/data` for SQLite / DB files
-  - Do not use `./api.yaml:/home/api.yaml` as the default single-file bind mount
-  - If you must use file mode, create `./api.yaml` on the host first; otherwise Docker may create a directory with that name and break config read/write
 
 Once persisted:
 
@@ -207,8 +206,8 @@ python main.py
 
 `/v1/*` endpoints are gateway APIs and require an API key by default:
 
-- `Authorization: Bearer sk-...` or `Authorization: Bearer zk-...`
-- or `x-api-key: sk-...` / `x-api-key: zk-...`
+- `Authorization: Bearer zk-...`
+- or `x-api-key: zk-...`
 
 Please configure `api_keys` in the admin console first.
 

@@ -15,31 +15,46 @@ import random
 import string
 import asyncio
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse
 
 from ..utils import (
+    BaseAPI,
     safe_get,
     get_model_dict,
     get_base64_image,
     generate_sse_response,
+    generate_chunked_image_md,
     end_of_line,
 )
-from ..file_utils import (
-    normalize_file_ref,
-    require_text_file_content,
-    raise_fileref_unsupported_error,
-)
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _normalize_responses_base_url(base_url: str) -> str:
+    """归一化 base_url，去除末尾的 /responses 端点路径，确保只保留到 /v1 层级。
+    兼容旧配置 .../v1/responses 和新配置 .../v1。"""
+    if base_url.endswith('#'):
+        return base_url  # 保留 '#'，由 resolve_base_url 处理
+    url = base_url.rstrip('/')
+    if url.endswith('/v1/responses'):
+        url = url[:-len('/responses')]
+    return url
 
 # ============================================================
 # 请求构建
 # ============================================================
 
 
-def format_input_text(text: str) -> dict:
-    """格式化文本为 Responses API input_text 格式"""
-    return {"type": "input_text", "text": text}
+def format_text_item(text: str, role: str) -> dict:
+    """格式化文本为 Responses API 格式，assistant 用 output_text，其他用 input_text"""
+    item_type = "output_text" if role == "assistant" else "input_text"
+    return {"type": item_type, "text": text}
 
 
 async def format_input_image(image_url: str) -> dict:
@@ -51,57 +66,6 @@ async def format_input_image(image_url: str) -> dict:
     }
 
 
-async def format_input_file(file_ref) -> dict:
-    """格式化 FileRef 为 Responses API 输入。"""
-    normalized = await normalize_file_ref(file_ref)
-    if normalized.file_id:
-        payload = {"type": "input_file", "file_id": normalized.file_id}
-        if normalized.filename:
-            payload["filename"] = normalized.filename
-        return payload
-
-    if not normalized.is_resolved or not normalized.data_url:
-        raise_fileref_unsupported_error("OpenAI Responses", normalized.mime_type, "图片、文本、PDF 等可解析附件或 file_id")
-
-    if normalized.is_image:
-        return {
-            "type": "input_image",
-            "image_url": normalized.data_url,
-        }
-
-    return {
-        "type": "input_file",
-        "filename": normalized.filename or "attachment",
-        "file_data": normalized.data_url,
-    }
-
-
-def _normalize_responses_base_url(base_url: str | None) -> tuple[str, str, str]:
-    """统一规范化 Responses 渠道的基础 URL。
-
-    Returns:
-        tuple[str, str, str]: (v1_base_url, responses_url, models_url)
-    """
-
-    raw_base_url = str(base_url or "https://api.openai.com/v1").strip()
-    parsed = urlparse(raw_base_url)
-    path = (parsed.path or "").rstrip("/")
-
-    if path.endswith("/responses"):
-        path = path[: -len("/responses")]
-
-    idx = path.rfind("/v1")
-    if idx != -1 and (idx + 3 == len(path) or path[idx + 3 : idx + 4] == "/"):
-        path = path[: idx + 3]
-    else:
-        path = f"{path}/v1" if path else "/v1"
-
-    v1_base_url = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
-    responses_url = urlunparse((parsed.scheme, parsed.netloc, f"{path}/responses", "", "", ""))
-    models_url = urlunparse((parsed.scheme, parsed.netloc, f"{path}/models", "", "", ""))
-    return v1_base_url, responses_url, models_url
-
-
 async def get_responses_passthrough_meta(request, engine, provider, api_key=None):
     """透传用：仅构建 url/headers，payload 由入口原生请求提供"""
     headers = {
@@ -110,7 +74,10 @@ async def get_responses_passthrough_meta(request, engine, provider, api_key=None
     if api_key:
         headers['Authorization'] = f"Bearer {api_key}"
 
-    _, url, _ = _normalize_responses_base_url(provider.get('base_url'))
+    from ..utils import resolve_base_url
+    url = resolve_base_url(_normalize_responses_base_url(
+        provider.get('base_url', 'https://api.openai.com/v1')
+    ), '/responses')
 
     return url, headers, {}
 
@@ -136,128 +103,6 @@ def _as_text_from_responses_content(content) -> str:
     return str(content)
 
 
-async def patch_passthrough_responses_payload(
-    payload: dict,
-    modifications: dict,
-    request,
-    engine: str,
-    provider: dict,
-    api_key=None,
-) -> dict:
-    """透传模式下对 Responses API payload 做渠道级修饰（尽量对齐 b119589 的稳定行为）。
-
-    目标：
-    - 只做轻量修补，但确保不会因为 Responses API 严格校验而炸：
-      1) system_prompt 注入
-      2) system/developer（开头连续）尽量收敛到 instructions（避免被当作 input 传上游）
-      3) 清理常见不支持字段
-      4) 强制 store=false
-
-    注意：
-    - o1-mini / o1-preview 场景：优先用 developer message 放进 input，避免依赖 instructions
-    """
-
-    # 识别上游原始模型（用于兼容 o1-mini / o1-preview）
-    try:
-        model_dict = get_model_dict(provider)
-        original_model = model_dict.get(getattr(request, "model", None), getattr(request, "model", ""))
-    except Exception:
-        original_model = getattr(request, "model", "") or ""
-
-    is_o1_mini_like = ("o1-mini" in original_model) or ("o1-preview" in original_model)
-
-    # 渠道 system_prompt
-    system_prompt = modifications.get("system_prompt")
-    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
-
-    input_items = payload.get("input")
-    if not isinstance(input_items, list):
-        input_items = None
-
-    def _make_dev_message_item(text: str) -> dict:
-        # 尽量跟现有 payload 风格一致
-        if input_items and isinstance(input_items, list) and input_items and isinstance(input_items[0], dict) and "type" in input_items[0]:
-            return {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]}
-        return {"role": "developer", "content": text}
-
-    # 1) o1-mini/o1-preview：system_prompt 尽量塞进 input 作为 developer
-    if system_prompt_text and is_o1_mini_like and isinstance(input_items, list):
-        # 如果第一个就是 developer/system，尝试拼接；否则插入
-        if input_items and isinstance(input_items[0], dict) and input_items[0].get("role") in ("developer", "system"):
-            first = input_items[0]
-            old = _as_text_from_responses_content(first.get("content")).strip()
-            merged = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
-
-            # 回写 content（尽量保持原结构）
-            if isinstance(first.get("content"), list):
-                # 找第一个 input_text/text
-                wrote = False
-                for part in first.get("content"):
-                    if isinstance(part, dict) and part.get("type") in ("input_text", "text"):
-                        part["type"] = "input_text"
-                        part["text"] = merged
-                        wrote = True
-                        break
-                if not wrote:
-                    first["content"].insert(0, {"type": "input_text", "text": system_prompt_text})
-            else:
-                first["content"] = merged
-
-            first["role"] = "developer"
-        else:
-            input_items.insert(0, _make_dev_message_item(system_prompt_text))
-
-        payload["input"] = input_items
-
-    # 2) 非 o1-mini：system/developer（开头连续）抽到 instructions + system_prompt 注入 instructions
-    else:
-        extracted_parts = []
-        if isinstance(input_items, list) and input_items:
-            new_input = list(input_items)
-            while new_input:
-                first = new_input[0]
-                if not isinstance(first, dict):
-                    break
-                role = first.get("role")
-                if role not in ("system", "developer"):
-                    break
-                extracted_parts.append(_as_text_from_responses_content(first.get("content")).strip())
-                new_input.pop(0)
-            if len(new_input) != len(input_items):
-                payload["input"] = new_input
-
-        extracted_text = "\n\n".join([p for p in extracted_parts if p]).strip()
-
-        old_inst = payload.get("instructions")
-        old_inst_text = old_inst.strip() if isinstance(old_inst, str) else ""
-
-        inst_parts = []
-        if system_prompt_text:
-            inst_parts.append(system_prompt_text)
-        if extracted_text:
-            inst_parts.append(extracted_text)
-        if old_inst_text:
-            inst_parts.append(old_inst_text)
-
-        final_inst = "\n\n".join([p for p in inst_parts if p]).strip()
-        if final_inst:
-            payload["instructions"] = final_inst
-
-    # 3) 清理 Responses API 常见不支持字段（透传也做兜底，避免上游严格校验报错）
-    for k in (
-        "temperature", "top_p",
-        "presence_penalty", "frequency_penalty",
-        "n", "logprobs", "top_logprobs",
-        "stream_options",
-    ):
-        payload.pop(k, None)
-
-    # 4) 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
-    payload["store"] = False
-
-    return payload
-
-
 async def get_responses_payload(request, engine, provider, api_key=None):
     """构建 OpenAI Responses API 的请求 payload（对齐 b119589 的稳定实现）"""
     headers = {
@@ -269,8 +114,10 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     if api_key:
         headers['Authorization'] = f"Bearer {api_key}"
 
-    # 构建 URL
-    _, url, _ = _normalize_responses_base_url(provider.get('base_url'))
+    from ..utils import resolve_base_url
+    url = resolve_base_url(_normalize_responses_base_url(
+        provider.get('base_url', 'https://api.openai.com/v1')
+    ), '/responses')
 
     # 构建 input 和 instructions
     input_items = []
@@ -302,21 +149,31 @@ async def get_responses_payload(request, engine, provider, api_key=None):
             content_items = []
             for item in content:
                 if getattr(item, "type", None) == "text":
-                    content_items.append(format_input_text(item.text))
+                    content_items.append(format_text_item(item.text, role))
                 elif getattr(item, "type", None) == "image_url" and provider.get("image", True):
                     image_item = await format_input_image(item.image_url.url)
                     content_items.append(image_item)
                 elif getattr(item, "type", None) == "file":
-                    file_ref = getattr(item, "file", None)
-                    if file_ref:
-                        normalized_file = await normalize_file_ref(file_ref)
-                        if normalized_file.file_id:
-                            content_items.append(await format_input_file(file_ref))
-                        else:
-                            if normalized_file.is_text and not normalized_file.is_image:
-                                content_items.append(format_input_text(normalized_file.render_text_attachment() or require_text_file_content(normalized_file, "OpenAI Responses", "图片、文本、PDF 等可解析附件或 file_id")))
+                    if getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
+                        image_item = await format_input_image(item.file.url)
+                        content_items.append(image_item)
+                    elif getattr(item.file, "data", None) and str(item.file.mime_type).startswith("image/"):
+                        image_item = await format_input_image(f"data:{item.file.mime_type};base64,{item.file.data}")
+                        content_items.append(image_item)
+                    else:
+                        file_item = {"type": "input_file"}
+                        if getattr(item.file, "filename", None):
+                            file_item["filename"] = item.file.filename
+                        if getattr(item.file, "file_id", None):
+                            file_item["file_id"] = item.file.file_id
+                        elif getattr(item.file, "url", None):
+                            if item.file.url.startswith("http"):
+                                file_item["file_url"] = item.file.url
                             else:
-                                content_items.append(await format_input_file(file_ref))
+                                file_item["file_data"] = item.file.url
+                        elif getattr(item.file, "data", None):
+                            file_item["file_data"] = f"data:{item.file.mime_type or 'application/octet-stream'};base64,{item.file.data}"
+                        content_items.append(file_item)
             if content_items:
                 input_items.append({"type": "message", "role": role, "content": content_items})
 
@@ -334,7 +191,7 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                 input_items.append({
                     "type": "message",
                     "role": role,
-                    "content": [{"type": "input_text", "text": content or ""}],
+                    "content": [format_text_item(content or "", role)],
                 })
 
             # tool_calls -> function_call（顶层 item）
@@ -510,16 +367,10 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     payload.pop("logprobs", None)
     payload.pop("top_logprobs", None)
     payload.pop("stream_options", None)
+    payload.pop("max_tokens", None)
+    payload.pop("max_completion_tokens", None)
 
     # 覆盖配置
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
-
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
     # （例如："Store must be set to false"）
     payload["store"] = False
@@ -534,7 +385,7 @@ async def get_responses_payload(request, engine, provider, api_key=None):
 
 async def fetch_responses_response(client, url, headers, payload, model, timeout):
     """处理 Responses API 的非流式响应"""
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
 
     error_message = await check_response(response, "fetch_responses_response")
@@ -543,10 +394,22 @@ async def fetch_responses_response(client, url, headers, payload, model, timeout
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
 
     # 将 Responses API 响应转换为 Chat Completions 格式
     converted = await convert_responses_to_chat_completions(response_json, model)
+    mark_adapter_metrics_managed()
+    usage = converted.get("usage") or {}
+    raw_usage = response_json.get("usage") or {}
+    # 转换后的 usage 不保留 input_tokens_details，因此缓存字段要从 Responses API 原始 usage 中提取。
+    merge_usage(
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens", 0),
+        **extract_cache_usage(raw_usage),
+    )
+    if safe_get(converted, "choices", 0, "message", "content", default=None):
+        mark_content_start()
     yield converted
 
 
@@ -556,7 +419,8 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
-    content = ""
+    content_text = ""
+    content_images = []  # 收集图片 items
     reasoning_content = ""
     tool_calls = []
 
@@ -578,7 +442,7 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
             for c in item_content:
                 c_type = c.get("type", "")
                 if c_type == "output_text":
-                    content += c.get("text", "")
+                    content_text += c.get("text", "")
                 elif c_type == "tool_use":
                     tool_calls.append({
                         "id": c.get("id", f"call_{random_str[:24]}"),
@@ -588,6 +452,25 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
                             "arguments": c.get("arguments", "{}")
                         }
                     })
+
+        elif item_type == "image_generation_call":
+            # gpt-image-2 等模型的生图结果：结构化 image_url item
+            result = item.get("result", "")
+            if result and result.strip():
+                content_images.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                })
+
+    # 构建 content：有图片时用结构化 list，纯文本时保持 string
+    if content_images:
+        content_items = []
+        if content_text:
+            content_items.append({"type": "text", "text": content_text})
+        content_items.extend(content_images)
+        content = content_items
+    else:
+        content = content_text
 
     # 构建 Chat Completions 响应
     message = {
@@ -620,11 +503,17 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     # 添加 usage
     usage = response.get("usage", {})
     if usage:
+        # Responses 非流式转换为 Chat Completions 时保留 input_tokens_details.cached_tokens。
+        cache_usage = extract_cache_usage(usage)
         result["usage"] = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0)
         }
+        if cache_usage["cached_tokens"] > 0:
+            result["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_usage["cached_tokens"]}
+        if cache_usage["cache_creation_tokens"] > 0:
+            result["usage"]["cache_creation_tokens"] = cache_usage["cache_creation_tokens"]
 
     return result
 
@@ -650,7 +539,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
 
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_responses_stream")
@@ -658,17 +547,16 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
             yield error_message
             return
 
-        buffer = ""
+        mark_adapter_metrics_managed()
         input_tokens = 0
         output_tokens = 0
+        # Responses API 的缓存字段只在 completed 事件 usage 中出现，先暂存再写入 current_info。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         has_sent_role = False
         has_sent_content = False  # 追踪是否已发送任何内容
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 # 跳过空行和注释
                 if not line or line.startswith(":"):
@@ -686,7 +574,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         break
 
                     try:
-                        data = await asyncio.to_thread(json.loads, data_str)
+                        data = json_loads(data_str)
                     except json.JSONDecodeError:
                         continue
 
@@ -708,6 +596,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     if event_type == "response.reasoning.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, reasoning_content=delta
                             )
@@ -718,6 +607,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     elif event_type == "response.reasoning_summary_text.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, reasoning_content=delta
                             )
@@ -728,25 +618,24 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     elif event_type == "response.output_text.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, content=delta
                             )
                             yield sse_string
                             has_sent_content = True
 
-                    # output text done -> finish_reason
-                    # 只有当已发送内容时才发送 stop，避免空响应
+                    # output text done
+                    # 注意：不在此处发送 stop，统一由 response.completed 发送
+                    # 避免 text + image 混合响应时提前终止流（image 在 output_item.done 中处理）
                     elif event_type == "response.output_text.done":
-                        if has_sent_content:
-                            sse_string = await generate_sse_response(
-                                timestamp, model, stop="stop"
-                            )
-                            yield sse_string
+                        pass
 
                     # function call arguments delta
                     elif event_type == "response.function_call_arguments.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, function_call_content=delta
                             )
@@ -762,12 +651,46 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         )
                         yield sse_string
 
+                    # image generation call completed -> inline markdown image
+                    elif event_type == "response.output_item.done":
+                        item = data.get("item", {})
+                        if item.get("type") == "image_generation_call":
+                            result = item.get("result", "")
+                            if result and result.strip():
+                                if not has_sent_role:
+                                    sse_string = await generate_sse_response(timestamp, model, role="assistant")
+                                    yield sse_string
+                                    has_sent_role = True
+
+                                mark_content_start()
+                                # 发结构化 image content item，方言出口各自转换
+                                image_content_item = [{
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                                }]
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, content=image_content_item
+                                )
+                                yield sse_string
+                                has_sent_content = True
+
                     # response completed -> 提取 usage，同时确保发送 stop
                     elif event_type == "response.completed":
                         response_data = data.get("response", {})
                         usage = response_data.get("usage", {})
                         input_tokens = usage.get("input_tokens", 0)
                         output_tokens = usage.get("output_tokens", 0)
+                        # completed 事件携带 input_tokens_details.cached_tokens，需要在转换为 Chat SSE 前保存。
+                        _cache_usage = extract_cache_usage(usage)
+                        cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=input_tokens + output_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         
                         # 如果还没发送 stop，在这里发送
                         if has_sent_content:
@@ -782,7 +705,10 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                 timestamp, model,
                 total_tokens=input_tokens + output_tokens,
                 prompt_tokens=input_tokens,
-                completion_tokens=output_tokens
+                completion_tokens=output_tokens,
+                # Responses API 的缓存字段在 completed 事件中暂存，最终 Chat SSE usage chunk 需要一并输出。
+                cached_tokens=cached_tokens,
+                cache_creation_tokens=cache_creation_tokens,
             )
             yield sse_string
 
@@ -791,7 +717,10 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
 
 async def fetch_responses_models(client, provider):
     """获取 Responses API 支持的模型列表"""
-    _, _, models_url = _normalize_responses_base_url(provider.get('base_url'))
+    from ..utils import resolve_base_url
+    raw_base_url = provider.get('base_url', 'https://api.openai.com/v1')
+    is_fixed = raw_base_url.endswith('#')
+    base_url = resolve_base_url(_normalize_responses_base_url(raw_base_url), '')
     api_key = provider.get('api')
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
@@ -799,6 +728,8 @@ async def fetch_responses_models(client, provider):
     headers = {'Content-Type': 'application/json'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
+
+    models_url = base_url if is_fixed else f"{base_url}/models"
 
     response = await client.get(models_url, headers=headers)
     response.raise_for_status()
@@ -830,7 +761,6 @@ def register():
         description="OpenAI Responses API（GPT-5/o1/o3/o4 等新模型专用）",
         request_adapter=get_responses_payload,
         passthrough_adapter=get_responses_passthrough_meta,
-        passthrough_payload_adapter=patch_passthrough_responses_payload,
         response_adapter=fetch_responses_response,
         stream_adapter=fetch_responses_stream,
         models_adapter=fetch_responses_models,

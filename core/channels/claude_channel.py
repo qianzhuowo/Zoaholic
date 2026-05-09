@@ -8,77 +8,41 @@ import json
 import copy
 import asyncio
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse
 
 from ..utils import (
     safe_get,
     get_model_dict,
-    build_claude_thinking_payload,
-    apply_claude_thinking_constraints,
     get_base64_image,
     get_tools_mode,
     generate_sse_response,
     generate_no_stream_response,
     end_of_line,
 )
-from ..file_utils import (
-    normalize_file_ref,
-    raise_fileref_unsupported_error,
-    require_resolved_file_data,
-    require_text_file_content,
-)
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
 
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _normalize_claude_base_url(base_url: str) -> str:
+    """归一化 Claude base_url，去除末尾的 /messages 端点路径，确保只保留到 /v1 层级。
+    兼容旧配置 https://api.anthropic.com/v1/messages 和新配置 https://api.anthropic.com/v1。"""
+    if base_url.endswith('#'):
+        return base_url  # 保留 '#'，由 resolve_base_url 处理
+    url = base_url.rstrip('/')
+    if url.endswith('/v1/messages'):
+        url = url[:-len('/messages')]
+    return url
 
 # ============================================================
 # Claude 格式化函数
 # ============================================================
-
-
-def _anthropic_build_v1_url(base_url: str, suffix: str) -> str:
-    """根据用户配置的 base_url 构造 Anthropic v1 下的具体端点 URL。
-
-    兼容以下几种填写方式：
-    - https://api.anthropic.com/v1
-    - https://api.anthropic.com/v1/
-    - https://api.anthropic.com/v1/messages
-    - https://api.anthropic.com/v1/messages/
-    - https://<proxy>/any/prefix/v1/messages
-
-    Args:
-        base_url: 渠道配置中的 base_url
-        suffix: 端点后缀，如 "messages" / "models"（可带或不带前导 /）
-
-    Returns:
-        str: 拼接后的完整 URL
-    """
-
-    if not base_url:
-        return ""
-
-    suffix = str(suffix or "").strip()
-    suffix = suffix.lstrip("/")
-
-    parsed = urlparse(str(base_url).strip())
-    path = (parsed.path or "").rstrip("/")
-
-    # 1) 如果用户填的是 /v1/messages，把 /messages 去掉
-    if path.endswith("/messages"):
-        path = path[: -len("/messages")]
-
-    # 2) 确保落在 .../v1
-    if not path.endswith("/v1"):
-        # 尝试截断到最后一个 /v1（支持自建反代前缀）
-        idx = path.rfind("/v1")
-        if idx != -1 and (idx + 3 == len(path) or path[idx + 3 : idx + 4] == "/"):
-            path = path[: idx + 3]
-        else:
-            path = (path + "/v1") if path else "/v1"
-
-    # 3) 拼接 suffix
-    final_path = f"{path}/{suffix}" if suffix else path
-
-    return urlunparse((parsed.scheme, parsed.netloc, final_path, "", "", ""))
 
 def format_text_message(text: str) -> dict:
     """格式化文本消息为 Claude 格式"""
@@ -93,46 +57,8 @@ async def format_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
-    }
-
-
-async def format_file_message(file_ref) -> dict:
-    """格式化 FileRef 为 Claude 内容块。"""
-    normalized = await normalize_file_ref(file_ref)
-    if normalized.file_id:
-        raise_fileref_unsupported_error("Claude", normalized.mime_type, "图片、PDF、纯文本附件（需提供 file.url/file.data）")
-
-    if normalized.is_image:
-        mime_type, base64_data = require_resolved_file_data(normalized, "Claude", "图片、PDF、纯文本附件")
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime_type,
-                "data": base64_data,
-            }
-        }
-
-    if normalized.is_pdf:
-        mime_type, base64_data = require_resolved_file_data(normalized, "Claude", "图片、PDF、纯文本附件")
-        payload = {
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": mime_type,
-                "data": base64_data,
-            }
-        }
-        if normalized.filename:
-            payload["title"] = normalized.filename
-        return payload
-
-    text_content = require_text_file_content(normalized, "Claude", "图片、PDF、纯文本附件")
-    return {
-        "type": "text",
-        "text": normalized.render_text_attachment() or text_content,
     }
 
 
@@ -168,7 +94,7 @@ async def gpt2claude_tools_json(json_dict):
 
     # 提取 $defs 定义
     defs = {}
-    if "parameters" in json_dict and "defs" in json_dict["parameters"]:
+    if "parameters" in json_dict and isinstance(json_dict["parameters"], dict) and "defs" in json_dict["parameters"]:
         defs = json_dict["parameters"]["defs"]
         # 从参数中删除 $defs，因为 Claude 不需要它
         del json_dict["parameters"]["defs"]
@@ -225,6 +151,28 @@ async def patch_passthrough_claude_payload(
     return payload
 
 
+async def get_claude_passthrough_meta(request, engine, provider, api_key=None):
+    """透传用：仅构建 url/headers，不执行 payload 转换。
+
+    透传模式下 payload 取自入口原始请求体，此函数只负责提供
+    上游 URL 和认证/版本头信息，避免执行完整的 get_claude_payload()
+    中 messages/tools 转换逻辑。
+
+    注意：anthropic-beta 不在此设置。透传模式下客户端原始请求头中
+    的 anthropic-beta 会由 process_request_passthrough 自动合并，
+    无需此处预设默认值。
+    """
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": f"{api_key}",
+        "anthropic-version": "2023-06-01",
+    }
+    from ..utils import resolve_base_url
+    url = resolve_base_url(_normalize_claude_base_url(provider['base_url']), '/messages')
+
+    return url, headers, {}
+
+
 async def get_claude_payload(request, engine, provider, api_key=None):
     """构建 Claude API 的请求 payload"""
     model_dict = get_model_dict(provider)
@@ -243,10 +191,8 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         "anthropic-version": "2023-06-01",
         "anthropic-beta": anthropic_beta,
     }
-    # 兼容 base_url 填 /v1 或 /v1/messages
-    url = _anthropic_build_v1_url(provider.get('base_url', ''), 'messages')
-    if not url:
-        url = provider.get('base_url', '')
+    from ..utils import resolve_base_url
+    url = resolve_base_url(_normalize_claude_base_url(provider['base_url']), '/messages')
 
     messages = []
     system_prompt = None
@@ -263,8 +209,56 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 elif item.type == "image_url" and provider.get("image", True):
                     image_message = await format_image_message(item.image_url.url)
                     content.append(image_message)
-                elif item.type == "file" and getattr(item, "file", None):
-                    content.append(await format_file_message(item.file))
+                elif item.type == "file":
+                    b64_data = ""
+                    mime_type = item.file.mime_type or "application/octet-stream"
+                    if getattr(item.file, "data", None):
+                        b64_data = item.file.data
+                    elif getattr(item.file, "url", None):
+                        from ..file_utils import get_base64_file, parse_data_uri
+                        data_uri, mime_type = await get_base64_file(item.file.url)
+                        if data_uri.startswith("data:"):
+                            _, b64_data = parse_data_uri(data_uri)
+                        else:
+                            b64_data = data_uri
+                    if b64_data:
+                        if mime_type.startswith("image/"):
+                            content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": b64_data,
+                                }
+                            })
+                        elif mime_type == "application/pdf":
+                            content.append({
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": b64_data,
+                                }
+                            })
+                        else:
+                            # 文本类文件：解码 base64 转为内联文本
+                            import base64 as _b64
+                            try:
+                                decoded_text = _b64.b64decode(b64_data).decode("utf-8")
+                                fname = getattr(item.file, "filename", "") or ""
+                                if fname:
+                                    decoded_text = f"📄 {fname}\n```\n{decoded_text}\n```"
+                                content.append({"type": "text", "text": decoded_text})
+                            except Exception:
+                                # 解码失败，尝试原样发 document（可能报错）
+                                content.append({
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": mime_type,
+                                        "data": b64_data,
+                                    }
+                                })
         else:
             content = msg.content
             tool_calls = msg.tool_calls
@@ -281,13 +275,13 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_id,
+                "tool_use_id": tool_call_id,
                 "content": content
             }]})
         elif msg.role == "function":
@@ -305,7 +299,15 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
-            system_prompt = content
+            if system_prompt is None:
+                system_prompt = content
+            elif isinstance(system_prompt, str) and isinstance(content, str):
+                system_prompt = system_prompt + "\n\n" + content
+            elif isinstance(system_prompt, list) and isinstance(content, list):
+                system_prompt = system_prompt + content
+            else:
+                # 类型不一致时（str vs list），以最新的为准并拼接旧内容为文本
+                system_prompt = (str(system_prompt) + "\n\n" + str(content)) if content else system_prompt
 
     conversation_len = len(messages) - 1
     message_index = 0
@@ -313,13 +315,23 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         if messages[message_index]["role"] == messages[message_index + 1]["role"]:
             if messages[message_index].get("content"):
                 if isinstance(messages[message_index]["content"], list):
-                    messages[message_index]["content"].extend(messages[message_index + 1]["content"])
+                    next_content = messages[message_index + 1]["content"]
+                    if isinstance(next_content, list):
+                        messages[message_index]["content"].extend(next_content)
+                    elif isinstance(next_content, str):
+                        messages[message_index]["content"].append({"type": "text", "text": next_content})
+                    else:
+                        messages[message_index]["content"].append({"type": "text", "text": str(next_content)})
                 elif isinstance(messages[message_index]["content"], str) and isinstance(messages[message_index + 1]["content"], list):
                     content_list = [{"type": "text", "text": messages[message_index]["content"]}]
                     content_list.extend(messages[message_index + 1]["content"])
                     messages[message_index]["content"] = content_list
                 else:
-                    messages[message_index]["content"] += messages[message_index + 1]["content"]
+                    next_content = messages[message_index + 1]["content"]
+                    if isinstance(messages[message_index]["content"], str) and isinstance(next_content, str):
+                        messages[message_index]["content"] += "\n" + next_content
+                    else:
+                        messages[message_index]["content"] += next_content
             messages.pop(message_index + 1)
             conversation_len = conversation_len - 1
         else:
@@ -341,13 +353,14 @@ async def get_claude_payload(request, engine, provider, api_key=None):
     miss_fields = [
         'model',
        'messages',
+        'tools',
+        'tool_choice',
         'presence_penalty',
         'frequency_penalty',
         'n',
         'user',
         'include_usage',
         'stream_options',
-        'thinking',
     ]
 
     for field, value in request.model_dump(exclude_unset=True).items():
@@ -378,53 +391,58 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 json_tool = await gpt2claude_tools_json(tool_dict)
                 tools.append(json_tool)
         payload["tools"] = tools
-        if "tool_choice" in payload:
-            if isinstance(payload["tool_choice"], dict):
-                if payload["tool_choice"]["type"] == "function":
+
+        # tool_choice 转换：从 request 对象读取，而非从 payload 读取
+        # （tool_choice 在 miss_fields 中被排除，不会自动进入 payload）
+        raw_tool_choice = request.tool_choice
+        if raw_tool_choice is not None:
+            if isinstance(raw_tool_choice, dict) or (hasattr(raw_tool_choice, 'type') and hasattr(raw_tool_choice, 'function')):
+                tc_dict = raw_tool_choice if isinstance(raw_tool_choice, dict) else raw_tool_choice.model_dump(exclude_none=True)
+                if tc_dict.get("type") == "function" and tc_dict.get("function", {}).get("name"):
                     payload["tool_choice"] = {
                         "type": "tool",
-                        "name": payload["tool_choice"]["function"]["name"]
+                        "name": tc_dict["function"]["name"]
                     }
-            if isinstance(payload["tool_choice"], str):
-                if payload["tool_choice"] == "auto":
-                    payload["tool_choice"] = {
-                        "type": "auto"
-                    }
-                if payload["tool_choice"] == "none":
-                    payload["tool_choice"] = {
-                        "type": "any"
-                    }
+                else:
+                    payload["tool_choice"] = tc_dict
+            elif isinstance(raw_tool_choice, str):
+                if raw_tool_choice == "auto":
+                    payload["tool_choice"] = {"type": "auto"}
+                elif raw_tool_choice == "none":
+                    payload["tool_choice"] = {"type": "any"}
+                elif raw_tool_choice == "required":
+                    payload["tool_choice"] = {"type": "any"}
 
     if tools_mode == "none":
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
-    thinking_config = None
-
     if "think" in request.model.lower():
-        thinking_config = build_claude_thinking_payload(budget_tokens=4096, thinking_type="enabled")
+        payload["thinking"] = {
+            "budget_tokens": 4096,
+            "type": "enabled"
+        }
+        payload["temperature"] = 1
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
         if request.model.split("-")[-1].isdigit():
             think_tokens = int(request.model.split("-")[-1])
             if think_tokens < max_tokens:
-                thinking_config = build_claude_thinking_payload(budget_tokens=think_tokens, thinking_type="enabled")
+                payload["thinking"] = {
+                    "budget_tokens": think_tokens,
+                    "type": "enabled"
+                }
 
     if request.thinking:
-        thinking_config = build_claude_thinking_payload(request.thinking)
-
-    if thinking_config:
+        thinking_config = {}
+        if request.thinking.budget_tokens is not None:
+            thinking_config["budget_tokens"] = request.thinking.budget_tokens
+        if request.thinking.type is not None:
+            thinking_config["type"] = request.thinking.type
         payload["thinking"] = thinking_config
-        if thinking_config.get("type") != "disabled":
-            apply_claude_thinking_constraints(payload)
-    else:
-        payload.pop("thinking", None)
-
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
+        payload["temperature"] = 1
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
 
     return url, headers, payload
 
@@ -432,7 +450,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
 async def fetch_claude_response(client, url, headers, payload, model, timeout):
     """处理 Claude 非流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
 
     error_message = await check_response(response, "fetch_claude_response")
@@ -441,7 +459,8 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
 
     # 遍历 content 数组，提取文本内容和客户端工具调用
     # 跳过服务器端工具（server_tool_use, web_search_tool_result）
@@ -477,9 +496,25 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     content = "".join(text_parts) if text_parts else None
     reasoning_content = "".join(thinking_parts) if thinking_parts else None
 
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    # Claude 的 input_tokens 不包含缓存创建和读取 token；prompt_tokens 需要按计量口径补齐。
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cache_creation_tokens"]
+        + cache_usage["cached_tokens"]
+    ) or None
+    output_tokens = usage.get("output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+        **cache_usage,
+    )
+    if content or reasoning_content or function_call_name:
+        mark_content_start()
 
     role = safe_get(response_json, "role")
 
@@ -487,37 +522,64 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
         timestamp, model, content=content, tools_id=tools_id,
         function_call_name=function_call_name, function_call_content=function_call_content,
         role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
-        completion_tokens=output_tokens, reasoning_content=reasoning_content
+        completion_tokens=output_tokens, reasoning_content=reasoning_content,
+        # Claude 非流式缓存字段已统一提取；传给出口函数后才能继续给下游方言使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
 async def fetch_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Claude 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_claude_response_stream")
         if error_message:
             yield error_message
             return
-        buffer = ""
+        mark_adapter_metrics_managed()
         input_tokens = 0
+        # Claude 流式缓存字段出现在 message_start 的 usage 中，先暂存，等 output_tokens 到达时一起写入。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         # 跟踪当前 content_block 类型，用于区分服务器端工具和客户端工具
         current_block_type = None
         current_block_id = None
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
-                    resp: dict = await asyncio.to_thread(json.loads, line)
+                    resp: dict = json_loads(line)
 
-                    input_tokens = input_tokens or safe_get(resp, "message", "usage", "input_tokens", default=0)
+                    if not input_tokens and not cached_tokens and not cache_creation_tokens:
+                        msg_usage = safe_get(resp, "message", "usage", default={})
+                        if msg_usage:
+                            _cache_usage = extract_cache_usage(msg_usage)
+                            cached_tokens = _cache_usage["cached_tokens"]
+                            cache_creation_tokens = _cache_usage["cache_creation_tokens"]
+                            input_tokens = (
+                                (msg_usage.get("input_tokens") or 0)
+                                + cache_creation_tokens
+                                + cached_tokens
+                            )
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, None, None,
+                            total_tokens, input_tokens, output_tokens,
+                            # 流式 Claude 的缓存字段在 message_start 中采集，最终 usage chunk 需要一起输出。
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         yield sse_string
                         break
 
@@ -541,6 +603,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             function_call_name = content_block.get("name", "")
                             tools_id = content_block.get("id", "")
                             if tools_id and function_call_name:
+                                mark_content_start()
                                 sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
                                 yield sse_string
                             continue
@@ -558,6 +621,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                         if current_block_type == "tool_use" and delta_type == "input_json_delta":
                             partial_json = delta.get("partial_json", "")
                             if partial_json:
+                                mark_content_start()
                                 sse_string = await generate_sse_response(timestamp, model, None, None, None, partial_json)
                                 yield sse_string
                             continue
@@ -575,6 +639,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     # 正常文本输出
                     text = safe_get(resp, "delta", "text", default="")
                     if text:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, text)
                         yield sse_string
                         continue
@@ -585,18 +650,21 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     block_type = safe_get(resp, "content_block", "type", default="")
                     # 只处理客户端工具（tool_use），跳过服务器端工具（server_tool_use）
                     if tools_id and function_call_name and block_type == "tool_use":
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
                         yield sse_string
 
                     # thinking 内容
                     thinking_content = safe_get(resp, "delta", "thinking", default="")
                     if thinking_content:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, reasoning_content=thinking_content)
                         yield sse_string
 
                     # 客户端工具参数（兼容旧逻辑）
                     function_call_content = safe_get(resp, "delta", "partial_json", default="")
                     if function_call_content and current_block_type != "server_tool_use":
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
 
@@ -604,37 +672,39 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
 
 
 async def fetch_claude_models(client, provider):
-    """获取 Anthropic Claude API 的模型列表。
-
-    兼容 base_url 填写：
-    - .../v1
-    - .../v1/messages
-    """
-
-    api_key = provider.get("api")
+    """获取 Anthropic Claude API 的模型列表"""
+    from ..utils import resolve_base_url
+    raw_base_url = provider.get('base_url', 'https://api.anthropic.com/v1')
+    is_fixed = raw_base_url.endswith('#')
+    base_url = resolve_base_url(_normalize_claude_base_url(raw_base_url), '')
+    api_key = provider.get('api')
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
 
     headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
     }
     if api_key:
-        headers["x-api-key"] = str(api_key)
+        headers['x-api-key'] = api_key
 
-    base_url = provider.get("base_url", "")
-    url = _anthropic_build_v1_url(base_url, "models")
-    if not url:
-        # 兜底：尽量按 OpenAI 习惯拼接
-        url = str(base_url).rstrip("/") + "/models"
-
-    response = await client.get(url, headers=headers)
-    response.raise_for_status()
-
-    data = response.json()
     models = []
-    if isinstance(data, dict) and isinstance(data.get("data"), list):
-        models = [m.get("id") for m in data["data"] if isinstance(m, dict) and m.get("id")]
+    after_id = None
+    while True:
+        url = base_url if is_fixed else f"{base_url}/models?limit=1000"
+        if after_id and not is_fixed:
+            url += f"&after_id={after_id}"
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and 'data' in data:
+            models.extend(m.get('id') for m in data['data'] if m.get('id'))
+            if data.get('has_more') and data.get('last_id'):
+                after_id = data['last_id']
+            else:
+                break
+        else:
+            break
 
     return models
 
@@ -646,11 +716,12 @@ def register():
     register_channel(
         id="claude",
         type_name="anthropic",
-        default_base_url="https://api.anthropic.com/v1/messages",
+        default_base_url="https://api.anthropic.com/v1",
         auth_header="x-api-key: {api_key}",
         description="Anthropic Claude API",
         request_adapter=get_claude_payload,
         passthrough_payload_adapter=patch_passthrough_claude_payload,
+        passthrough_adapter=get_claude_passthrough_meta,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
         models_adapter=fetch_claude_models,

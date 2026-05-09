@@ -7,15 +7,70 @@
 import json
 from typing import Any, Dict, TYPE_CHECKING
 
+from core.json_utils import json_loads, json_dumps_text
 from fastapi import APIRouter, Request, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 
 from core.error_response import openai_error_response
-from core.auth_errors import AUTH_API_KEY_INVALID, auth_http_exception
 from .registry import get_dialect, list_dialects, EndpointDefinition
 
 if TYPE_CHECKING:
     from starlette.responses import Response
+
+
+def _flatten_stream_content(sse_chunk: str) -> str:
+    """将 SSE chunk 中结构化的 delta.content list 拍扁为 markdown 字符串。
+
+    作为方言基类的默认行为：不支持结构化图片的方言（OAI/Claude/Responses）
+    在 render_stream 之前自动调用。
+    """
+    if not isinstance(sse_chunk, str) or not sse_chunk.startswith("data: "):
+        return sse_chunk
+
+    data_str = sse_chunk[6:].strip()
+    if data_str == "[DONE]":
+        return sse_chunk
+
+    try:
+        chunk = json_loads(data_str)
+    except Exception:
+        return sse_chunk
+
+    choices = chunk.get("choices") or []
+    modified = False
+    for choice in choices:
+        delta = choice.get("delta")
+        if not delta:
+            continue
+        content = delta.get("content")
+        if isinstance(content, list):
+            # 拍扁结构化 content items 为 markdown string
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(text)
+                elif item_type == "image_url":
+                    image_url = item.get("image_url")
+                    url = ""
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(image_url, str):
+                        url = image_url
+                    if url:
+                        parts.append(f"![image]({url})")
+            delta["content"] = "\n\n".join(parts) if parts else ""
+            modified = True
+
+    if not modified:
+        return sse_chunk
+
+    return f"data: {json_dumps_text(chunk, ensure_ascii=False)}\n\n"
+
 
 # 全局方言路由器
 dialect_router = APIRouter()
@@ -71,7 +126,8 @@ def _create_dialect_verify_api_key(dialect_id: str):
             token = await _extract_token(request, credentials)
 
         if not token:
-            raise auth_http_exception(AUTH_API_KEY_INVALID)
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
         api_index: int | None = None
         token_for_stats = token
@@ -97,7 +153,8 @@ def _create_dialect_verify_api_key(dialect_id: str):
                 api_index = None
 
         if api_index is None:
-            raise auth_http_exception(AUTH_API_KEY_INVALID)
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
         # 更新 request_info 中的 API key 信息，确保统计记录正确的 key
         try:
@@ -155,6 +212,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             dialect_id=dialect_id,
             original_payload=native_body,
             original_headers=headers,
+            passthrough_only=endpoint.passthrough_only,
         )
 
         if resp.headers.get("x-zoaholic-passthrough") or resp.status_code != 200:
@@ -166,9 +224,17 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             debug = getattr(resp, "debug", False)
 
             async def convert_stream():
+                # 优先使用有状态的流渲染器工厂（如 Claude 方言），
+                # 每次流请求创建独立实例以维护 message_start 等生命周期状态
+                stream_renderer = dialect.render_stream_factory() if dialect.render_stream_factory else None
+                render_fn = stream_renderer or dialect.render_stream
+                # 默认拍扁：方言未声明 structured_stream 时，自动将结构化 content list 拍扁为 markdown string
+                should_flatten = not dialect.structured_stream
                 async for chunk in resp.body_iterator:
                     chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    converted = await dialect.render_stream(chunk_text) if dialect.render_stream else chunk_text
+                    if should_flatten:
+                        chunk_text = _flatten_stream_content(chunk_text)
+                    converted = await render_fn(chunk_text) if render_fn else chunk_text
                     if converted:
                         yield converted
 
@@ -180,7 +246,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         body_text = body_bytes.decode("utf-8") if body_bytes else "{}"
         
         try:
-            canonical_json = json.loads(body_text)
+            canonical_json = json_loads(body_text)
         except Exception:
             canonical_json = {}
 
@@ -189,7 +255,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         converted_json = await dialect.render_response(canonical_json, canonical_request.model) if dialect.render_response else canonical_json
 
         async def converted_iter():
-            yield json.dumps(converted_json, ensure_ascii=False)
+            yield json_dumps_text(converted_json, ensure_ascii=False)
 
         return LoggingStreamingResponse(converted_iter(), media_type="application/json",
                                         current_info=current_info, app=getattr(resp, "app", None),
@@ -209,6 +275,7 @@ def _create_custom_handler_wrapper(dialect_id: str, endpoint: EndpointDefinition
         api_index: int = Depends(verify_api_key),
     ):
         dialect = get_dialect(dialect_id)
+
         return await endpoint.handler(request=request, background_tasks=background_tasks,
                                        api_index=api_index, dialect=dialect)
 

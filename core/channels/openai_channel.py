@@ -18,14 +18,15 @@ from ..utils import (
     get_tools_mode,
     generate_sse_response,
     end_of_line,
+    generate_chunked_image_md,
     upload_image_to_0x0st,
 )
-from ..file_utils import (
-    normalize_file_ref,
-    raise_fileref_unsupported_error,
-    require_text_file_content,
-)
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
 
 
 # ============================================================
@@ -153,35 +154,6 @@ async def patch_passthrough_openai_payload(
     return payload
 
 
-async def format_file_message(file_ref, *, responses_mode: bool) -> dict:
-    """格式化 FileRef 为 OpenAI/Responses 所需格式。"""
-    file_id = getattr(file_ref, "file_id", None)
-    if responses_mode and file_id:
-        payload = {"type": "input_file", "file_id": file_id}
-        if getattr(file_ref, "filename", None):
-            payload["filename"] = file_ref.filename
-        return payload
-
-    normalized = await normalize_file_ref(file_ref)
-    if normalized.file_id:
-        raise_fileref_unsupported_error("OpenAI Chat Completions", normalized.mime_type, "图片、纯文本附件；若需 file_id / PDF / 二进制文件请改用 Responses API")
-
-    if normalized.is_image:
-        if responses_mode:
-            return {"type": "input_image", "image_url": normalized.data_url}
-        return {"type": "image_url", "image_url": {"url": normalized.data_url}}
-
-    if responses_mode:
-        return {
-            "type": "input_file",
-            "filename": normalized.filename or "attachment",
-            "file_data": normalized.data_url,
-        }
-
-    text_content = require_text_file_content(normalized, "OpenAI Chat Completions", "图片、纯文本附件；若需 PDF/二进制文件请改用 Responses API、Claude 或 Gemini")
-    return format_text_message(normalized.render_text_attachment() or text_content)
-
-
 async def get_gpt_payload(request, engine, provider, api_key=None):
     """构建 OpenAI 兼容 API 的请求 payload"""
     headers = {
@@ -201,9 +173,12 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
         headers['X-Title'] = "Zoaholic"
 
-    responses_mode = "v1/responses" in url
     messages = []
     for msg in request.messages:
+        # 透传 Message model 上的额外字段（reasoning_content 等）
+        # Message 使用 extra='allow'，客户端传入的非标准字段保存在 model_extra 中
+        extra_fields = {k: v for k, v in (msg.model_extra or {}).items() if v is not None}
+
         tool_calls = None
         tool_call_id = None
         if isinstance(msg.content, list):
@@ -211,19 +186,80 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             for item in msg.content:
                 if item.type == "text":
                     text_message = format_text_message(item.text)
-                    if responses_mode:
+                    if "v1/responses" in url:
                         text_message["type"] = "input_text"
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True) and "o1-mini" not in original_model:
                     image_message = await format_image_message(item.image_url.url)
-                    if responses_mode:
+                    if "v1/responses" in url:
                         image_message = {
                             "type": "input_image",
                             "image_url": image_message["image_url"]["url"]
                         }
                     content.append(image_message)
-                elif item.type == "file" and getattr(item, "file", None):
-                    content.append(await format_file_message(item.file, responses_mode=responses_mode))
+                elif item.type == "file":
+                    # 处理 OpenAI Responses 模式下的文件
+                    if "v1/responses" in url:
+                        if getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
+                            content.append({"type": "input_image", "image_url": item.file.url})
+                        elif getattr(item.file, "data", None) and str(item.file.mime_type).startswith("image/"):
+                            content.append({"type": "input_image", "image_url": f"data:{item.file.mime_type};base64,{item.file.data}"})
+                        else:
+                            file_item = {"type": "input_file"}
+                            if getattr(item.file, "filename", None):
+                                file_item["filename"] = item.file.filename
+                            if getattr(item.file, "file_id", None):
+                                file_item["file_id"] = item.file.file_id
+                            elif getattr(item.file, "url", None):
+                                if item.file.url.startswith("http"):
+                                    file_item["file_url"] = item.file.url
+                                else:
+                                    file_item["file_data"] = item.file.url
+                            elif getattr(item.file, "data", None):
+                                file_item["file_data"] = f"data:{item.file.mime_type or 'application/octet-stream'};base64,{item.file.data}"
+                            content.append(file_item)
+                    # 处理标准 Chat 模式下的文件
+                    else:
+                        is_image = False
+                        if item.file is None:
+                            continue
+                        if getattr(item.file, "mime_type", None) and item.file.mime_type.startswith("image/"):
+                            is_image = True
+                        elif getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
+                            is_image = True
+                        
+                        if is_image and provider.get("image", True) and "o1-mini" not in original_model:
+                            if getattr(item.file, "data", None):
+                                b64 = f"data:{item.file.mime_type};base64,{item.file.data}"
+                                content.append(await format_image_message(b64))
+                            elif getattr(item.file, "url", None):
+                                content.append(await format_image_message(item.file.url))
+                            else:
+                                pass
+                        else:
+                            # 非图片文件：尝试解码文本类文件为内联文本
+                            mime = getattr(item.file, "mime_type", "") or ""
+                            is_text = (
+                                mime.startswith("text/")
+                                or mime in (
+                                    "application/json", "application/xml", "application/yaml",
+                                    "application/x-yaml", "application/javascript",
+                                    "application/typescript", "application/sql",
+                                    "application/x-python", "application/toml",
+                                    "application/csv", "application/ld+json",
+                                )
+                            )
+                            if is_text and getattr(item.file, "data", None):
+                                import base64 as _b64
+                                try:
+                                    decoded = _b64.b64decode(item.file.data).decode("utf-8")
+                                    fname = getattr(item.file, "filename", "") or ""
+                                    if fname:
+                                        decoded = f"📄 {fname}\n```\n{decoded}\n```"
+                                    content.append({"type": "text", "text": decoded})
+                                except Exception:
+                                    pass  # 解码失败静默跳过
+                            # 其他类型静默跳过
         else:
             content = msg.content
             if msg.role == "system" and "o3-mini" in original_model and not content.startswith("Formatting re-enabled"):
@@ -246,19 +282,19 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                             "arguments": tool_call.function.arguments
                         }
                     })
-                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+                messages.append({"role": msg.role, "tool_calls": tool_calls_list, **extra_fields})
         elif tool_call_id:
             tools_mode = get_tools_mode(provider)
             if tools_mode != "none":
-                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
+                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content, **extra_fields})
         else:
-            messages.append({"role": msg.role, "content": content})
+            messages.append({"role": msg.role, "content": content, **extra_fields})
 
     if ("o1-mini" in original_model or "o1-preview" in original_model) and len(messages) > 1 and messages[0]["role"] == "system":
         system_msg = messages.pop(0)
         messages[0]["content"] = system_msg["content"] + messages[0]["content"]
 
-    if responses_mode:
+    if "v1/responses" in url:
         payload = {
             "model": original_model,
             "input": messages,
@@ -348,13 +384,6 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     }
                 })
 
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
 
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
     # （例如："Store must be set to false"）
@@ -366,7 +395,7 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
 
 async def fetch_openai_response(client, url, headers, payload, model, timeout):
     """处理 OpenAI 兼容 API 的非流式响应"""
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_openai_response")
@@ -375,11 +404,22 @@ async def fetch_openai_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
+    usage = safe_get(response_json, "usage", default={}) or {}
+    # 非流式 OpenAI 兼容响应在同一个 usage 对象中携带缓存字段，随普通 token 一起写入 current_info。
+    merge_usage(
+        prompt_tokens=safe_get(usage, "prompt_tokens", default=0),
+        completion_tokens=safe_get(usage, "completion_tokens", default=0),
+        total_tokens=safe_get(usage, "total_tokens", default=0),
+        **extract_cache_usage(usage),
+    )
 
     # 兼容原 core/response.py 中的特殊逻辑
     if "dashscope.aliyuncs.com" in url and "multimodal-generation" in url:
         content = safe_get(response_json, "output", "choices", 0, "message", "content", 0, default=None)
+        if content:
+            mark_content_start()
         yield content
     elif "embedContent" in url:
         content = safe_get(response_json, "embedding", "values", default=[])
@@ -400,6 +440,8 @@ async def fetch_openai_response(client, url, headers, payload, model, timeout):
         }
         yield response_embedContent
     else:
+        if safe_get(response_json, "choices", 0, "message", "content", default=None) or safe_get(response_json, "data", 0, "b64_json", default=None):
+            mark_content_start()
         yield response_json
 
 
@@ -413,7 +455,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
     is_thinking = False
     has_send_thinking = False
     ark_tag = False
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gpt_response_stream")
@@ -421,154 +463,224 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
             yield error_message
             return
 
-        buffer = ""
+        mark_adapter_metrics_managed()
         enter_buffer = ""
 
         input_tokens = 0
         output_tokens = 0
+        # 流式 usage 的缓存字段可能只在最后一个 chunk 出现，需要跨 chunk 暂存后统一 merge。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         done_received = False
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                # logger.info("line: %s", repr(line))
-                if line.startswith(": keepalive"):
-                    yield line + end_of_line
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
+            # logger.info("line: %s", repr(line))
+            if line.startswith(": keepalive"):
+                yield line + end_of_line
+                continue
+            if line and not line.startswith(":") and (result:=line.lstrip("data: ").strip()) and not line.startswith("event: "):
+                if result.strip() == "[DONE]":
+                    done_received = True
+                    break
+
+                line = json_loads(result)
+
+                # 提取 usage（OpenAI chat/completions 流式最后一个 chunk 中包含）
+                chunk_usage = line.get("usage") if isinstance(line, dict) else None
+                if chunk_usage and isinstance(chunk_usage, dict):
+                    _in = chunk_usage.get("prompt_tokens") if "prompt_tokens" in chunk_usage else chunk_usage.get("input_tokens", 0)
+                    _out = chunk_usage.get("completion_tokens") if "completion_tokens" in chunk_usage else chunk_usage.get("output_tokens", 0)
+                    # OpenAI、Responses API 和 DeepSeek 的缓存字段都在 usage 内，这里统一提取并跨 chunk 保留。
+                    _cache_usage = extract_cache_usage(chunk_usage)
+                    if _in:
+                        input_tokens = _in
+                    if _out:
+                        output_tokens = _out
+                    if _cache_usage["cached_tokens"]:
+                        cached_tokens = _cache_usage["cached_tokens"]
+                    if _cache_usage["cache_creation_tokens"]:
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"]
+
+                # 检查返回的 JSON 是否包含错误信息
+                if 'error' in line:
+                    yield {"error": "OpenAI Stream Error", "status_code": 400, "details": line}
+                    return
+
+                line['id'] = f"chatcmpl-{random_str}"
+
+                # v1/responses
+                if line.get("type") == "response.reasoning_summary_text.delta" and line.get("delta"):
+                    mark_content_start()
+                    sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=line.get("delta"))
+                    yield sse_string
                     continue
-                if line and not line.startswith(":") and (result:=line.lstrip("data: ").strip()) and not line.startswith("event: "):
-                    if result.strip() == "[DONE]":
-                        done_received = True
-                        break
-                    line = await asyncio.to_thread(json.loads, result)
-                    
-                    # 检查返回的 JSON 是否包含错误信息
-                    if 'error' in line:
-                        yield {"error": "OpenAI Stream Error", "status_code": 400, "details": line}
-                        return
-                        
-                    line['id'] = f"chatcmpl-{random_str}"
+                elif line.get("type") == "response.output_text.delta" and line.get("delta"):
+                    mark_content_start()
+                    sse_string = await generate_sse_response(timestamp, payload["model"], content=line.get("delta"))
+                    yield sse_string
+                    continue
+                elif line.get("type") == "response.output_text.done":
+                    sse_string = await generate_sse_response(timestamp, payload["model"], stop="stop")
+                    yield sse_string
+                    continue
+                elif line.get("type") == "response.completed":
+                    response_usage = safe_get(line, "response", "usage", default={}) or {}
+                    input_tokens = safe_get(response_usage, "input_tokens", default=0)
+                    output_tokens = safe_get(response_usage, "output_tokens", default=0)
+                    # Responses API 事件的缓存命中位于 input_tokens_details，需在转换为 Chat SSE 前保存。
+                    _cache_usage = extract_cache_usage(response_usage)
+                    cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                    cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                    merge_usage(
+                        prompt_tokens=input_tokens,
+                        completion_tokens=output_tokens,
+                        total_tokens=input_tokens + output_tokens,
+                        cached_tokens=cached_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
+                    )
+                    continue
+                elif line.get("type", "").startswith("response."):
+                    continue
 
-                    # v1/responses
-                    if line.get("type") == "response.reasoning_summary_text.delta" and line.get("delta"):
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=line.get("delta"))
-                        yield sse_string
-                        continue
-                    elif line.get("type") == "response.output_text.delta" and line.get("delta"):
-                        sse_string = await generate_sse_response(timestamp, payload["model"], content=line.get("delta"))
-                        yield sse_string
-                        continue
-                    elif line.get("type") == "response.output_text.done":
-                        sse_string = await generate_sse_response(timestamp, payload["model"], stop="stop")
-                        yield sse_string
-                        continue
-                    elif line.get("type") == "response.completed":
-                        input_tokens = safe_get(line, "response", "usage", "input_tokens", default=0)
-                        output_tokens = safe_get(line, "response", "usage", "output_tokens", default=0)
-                        continue
-                    elif line.get("type", "").startswith("response."):
-                        continue
+                # 处理 <think> 标签
+                content = safe_get(line, "choices", 0, "delta", "content", default="")
+                if "<think>" in content:
+                    is_thinking = True
+                    ark_tag = True
+                    content = content.replace("<think>", "")
+                if "</think>" in content:
+                    end_think_reasoning_content = ""
+                    end_think_content = ""
+                    is_thinking = False
 
-                    # 处理 <think> 标签
-                    content = safe_get(line, "choices", 0, "delta", "content", default="")
-                    if "<think>" in content:
-                        is_thinking = True
-                        ark_tag = True
-                        content = content.replace("<think>", "")
-                    if "</think>" in content:
-                        end_think_reasoning_content = ""
-                        end_think_content = ""
-                        is_thinking = False
-
-                        if content.rstrip('\n').endswith("</think>"):
-                            end_think_reasoning_content = content.replace("</think>", "").rstrip('\n')
-                        elif content.lstrip('\n').startswith("</think>"):
-                            end_think_content = content.replace("</think>", "").lstrip('\n')
-                        else:
-                            end_think_reasoning_content = content.split("</think>")[0]
-                            end_think_content = content.split("</think>")[1]
-
-                        if end_think_reasoning_content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=end_think_reasoning_content)
-                            yield sse_string
-                        if end_think_content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], content=end_think_content)
-                            yield sse_string
-                        continue
-                    if is_thinking and ark_tag:
-                        if not has_send_thinking:
-                            content = content.replace("\n\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
-                        continue
-
-                    # 处理 poe thinking 标签
-                    if "Thinking..." in content and "\n> " in content:
-                        is_thinking = True
-                        content = content.replace("Thinking...", "").replace("\n> ", "")
-                    if is_thinking and "\n\n" in content and not ark_tag:
-                        is_thinking = False
-                    if is_thinking and not ark_tag:
-                        content = content.replace("\n> ", "")
-                        if not has_send_thinking:
-                            content = content.replace("\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
-                        continue
-
-                    no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
-                    openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
-                    openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
-                    if openrouter_base64_image:
-                        image_url = await upload_image_to_0x0st(openrouter_base64_image)
-                        sse_string = await generate_sse_response(timestamp, payload["model"], content=f"\n\n![image]({image_url})")
-                        yield sse_string
-                        continue
-                    azure_databricks_claude_summary_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "text", default="")
-                    azure_databricks_claude_signature_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "signature", default="")
-                    if azure_databricks_claude_signature_content:
-                        pass
-                    elif azure_databricks_claude_summary_content:
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=azure_databricks_claude_summary_content)
-                        yield sse_string
-                    elif openrouter_reasoning:
-                        if openrouter_reasoning.endswith("\\"):
-                            enter_buffer += openrouter_reasoning
-                            continue
-                        elif enter_buffer.endswith("\\") and openrouter_reasoning == 'n':
-                            enter_buffer += "n"
-                            continue
-                        elif enter_buffer.endswith("\\n") and openrouter_reasoning == '\\n':
-                            enter_buffer += "\\n"
-                            continue
-                        elif enter_buffer.endswith("\\n\\n"):
-                            openrouter_reasoning = '\n\n' + openrouter_reasoning
-                            enter_buffer = ""
-                        elif enter_buffer:
-                            openrouter_reasoning = enter_buffer + openrouter_reasoning
-                            enter_buffer = ''
-                        openrouter_reasoning = openrouter_reasoning.replace("\\n", "\n")
-
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
-                        yield sse_string
-                    elif no_stream_content and has_send_thinking == False:
-                        sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
-                        yield sse_string
+                    if content.rstrip('\n').endswith("</think>"):
+                        end_think_reasoning_content = content.replace("</think>", "").rstrip('\n')
+                    elif content.lstrip('\n').startswith("</think>"):
+                        end_think_content = content.replace("</think>", "").lstrip('\n')
                     else:
-                        if no_stream_content:
-                            del line["choices"][0]["message"]
-                        json_line = await asyncio.to_thread(json.dumps, line)
-                        yield "data: " + json_line.strip() + end_of_line
-            
+                        end_think_reasoning_content = content.split("</think>")[0]
+                        end_think_content = content.split("</think>")[1]
+
+                    if end_think_reasoning_content:
+                        mark_content_start()
+                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=end_think_reasoning_content)
+                        yield sse_string
+                    if end_think_content:
+                        mark_content_start()
+                        sse_string = await generate_sse_response(timestamp, payload["model"], content=end_think_content)
+                        yield sse_string
+                    continue
+                if is_thinking and ark_tag:
+                    if not has_send_thinking:
+                        content = content.replace("\n\n", "")
+                    if content:
+                        mark_content_start()
+                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                        yield sse_string
+                        has_send_thinking = True
+                    continue
+
+                # 处理 poe thinking 标签
+                if "Thinking..." in content and "\n> " in content:
+                    is_thinking = True
+                    content = content.replace("Thinking...", "").replace("\n> ", "")
+                if is_thinking and "\n\n" in content and not ark_tag:
+                    is_thinking = False
+                if is_thinking and not ark_tag:
+                    content = content.replace("\n> ", "")
+                    if not has_send_thinking:
+                        content = content.replace("\n", "")
+                    if content:
+                        mark_content_start()
+                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                        yield sse_string
+                        has_send_thinking = True
+                    continue
+
+                no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
+                openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
+                # reasoning_details 数组格式回退：部分模型只返回 reasoning_details 而不带 reasoning
+                if not openrouter_reasoning:
+                    _reasoning_details = safe_get(line, "choices", 0, "delta", "reasoning_details", default=None)
+                    if _reasoning_details and isinstance(_reasoning_details, list):
+                        _parts = []
+                        for _rd_item in _reasoning_details:
+                            if isinstance(_rd_item, dict) and _rd_item.get("text"):
+                                _parts.append(_rd_item["text"])
+                        if _parts:
+                            openrouter_reasoning = "".join(_parts)
+                openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
+                if openrouter_base64_image:
+                    b64_pure = extract_base64_data(openrouter_base64_image if openrouter_base64_image.startswith("data:image/") else f"data:image/png;base64,{openrouter_base64_image}")
+                    # 发结构化 image content item，方言出口各自转换
+                    mark_content_start()
+                    image_content_item = [{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_pure}"}
+                    }]
+                    sse_string = await generate_sse_response(timestamp, payload["model"], content=image_content_item)
+                    yield sse_string
+                    continue
+
+                azure_databricks_claude_summary_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "text", default="")
+                azure_databricks_claude_signature_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "signature", default="")
+                if azure_databricks_claude_signature_content:
+                    pass
+                elif azure_databricks_claude_summary_content:
+                    sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=azure_databricks_claude_summary_content)
+                    yield sse_string
+                elif openrouter_reasoning:
+                    if openrouter_reasoning.endswith("\\"):
+                        enter_buffer += openrouter_reasoning
+                        continue
+                    elif enter_buffer.endswith("\\") and openrouter_reasoning == 'n':
+                        enter_buffer += "n"
+                        continue
+                    elif enter_buffer.endswith("\\n") and openrouter_reasoning == '\\n':
+                        enter_buffer += "\\n"
+                        continue
+                    elif enter_buffer.endswith("\\n\\n"):
+                        openrouter_reasoning = '\n\n' + openrouter_reasoning
+                        enter_buffer = ""
+                    elif enter_buffer:
+                        openrouter_reasoning = enter_buffer + openrouter_reasoning
+                        enter_buffer = ''
+                    openrouter_reasoning = openrouter_reasoning.replace("\\n", "\n")
+
+                    mark_content_start()
+                    sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
+                    yield sse_string
+                elif no_stream_content and has_send_thinking == False:
+                    mark_content_start()
+                    sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
+                    yield sse_string
+                else:
+                    if no_stream_content:
+                        del line["choices"][0]["message"]
+                    json_line = json_dumps_text(line, ensure_ascii=False)
+                    yield "data: " + json_line.strip() + end_of_line
+
             if done_received:
                 break
 
-    if input_tokens and output_tokens:
-        sse_string = await generate_sse_response(timestamp, payload["model"], None, None, None, None, None, total_tokens=input_tokens + output_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
+    if input_tokens or output_tokens:
+        # 结束时再 merge 一次，确保只在末尾出现的缓存字段不会被遗漏。
+        merge_usage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+        sse_string = await generate_sse_response(
+            timestamp, payload["model"], None, None, None, None, None,
+            total_tokens=input_tokens + output_tokens,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            # 结束 usage chunk 需要带上前面跨 chunk 暂存的缓存字段，避免只写入统计而不返回给下游。
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line
@@ -576,7 +688,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
 async def fetch_openai_models(client, provider):
     """获取 OpenAI 兼容 API 的模型列表"""
-    base_url = provider.get('base_url', 'https://api.openai.com/v1').rstrip('/')
+    raw_base_url = provider.get('base_url', 'https://api.openai.com/v1')
     api_key = provider.get('api')
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
@@ -585,7 +697,8 @@ async def fetch_openai_models(client, provider):
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     
-    url = f"{base_url}/models"
+    from ..utils import resolve_base_url
+    url = resolve_base_url(raw_base_url, '/models')
     response = await client.get(url, headers=headers)
     response.raise_for_status()
     

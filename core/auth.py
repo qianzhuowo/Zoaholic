@@ -12,12 +12,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from core.log_config import logger
 from utils import InMemoryRateLimiter
-from core.auth_errors import (
-    AUTH_ADMIN_CREDENTIALS_INVALID,
-    AUTH_API_KEY_INVALID,
-    AUTH_PERMISSION_DENIED,
-    auth_http_exception,
-)
 
 # 全局安全方案和速率限制器
 security = HTTPBearer(auto_error=False)  # 设置 auto_error=False 以便我们自己处理缺失的情况
@@ -105,7 +99,7 @@ async def verify_api_key(
     token = await _extract_token(request, credentials)
 
     if not token:
-        raise auth_http_exception(AUTH_API_KEY_INVALID)
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
     api_index: Optional[int] = None
     try:
@@ -124,7 +118,7 @@ async def verify_api_key(
             api_index = None
 
     if api_index is None:
-        raise auth_http_exception(AUTH_API_KEY_INVALID)
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
     return api_index
 
@@ -146,7 +140,7 @@ async def verify_admin_api_key(
 
     token = await _extract_token(request, credentials)
     if not token:
-        raise auth_http_exception(AUTH_ADMIN_CREDENTIALS_INVALID)
+        raise HTTPException(status_code=403, detail="Invalid or missing credentials")
 
     # 1) 先尝试当作 JWT
     try:
@@ -168,7 +162,7 @@ async def verify_admin_api_key(
         api_index = None
 
     if api_index is None:
-        raise auth_http_exception(AUTH_ADMIN_CREDENTIALS_INVALID)
+        raise HTTPException(status_code=403, detail="Invalid or missing credentials")
 
     # 单 key 情况直接视为 admin
     if len(api_list) == 1:
@@ -176,6 +170,6 @@ async def verify_admin_api_key(
 
     # 检查配置中的角色
     if "admin" not in app.state.api_keys_db[api_index].get("role", ""):
-        raise auth_http_exception(AUTH_PERMISSION_DENIED)
+        raise HTTPException(status_code=403, detail="Permission denied")
 
     return token

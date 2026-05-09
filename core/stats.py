@@ -29,6 +29,13 @@ from core.d1_client import format_d1_datetime
 SQLITE_MAX_RETRIES = 3
 SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 
+# Prompt Caching 新增列需要在各数据库的简易迁移中显式带 DEFAULT 0，避免旧表新增列后出现 NULL。
+PROMPT_CACHE_STAT_COLUMNS = {"cached_tokens", "cache_creation_tokens"}
+# 修改原因：D1 的 CREATE TABLE IF NOT EXISTS 不会给旧表补列，而新增上游响应头后 D1 写入会包含该列。
+# 修改方式：为 D1 启动迁移单独维护新增的文本日志列集合。
+# 目的：确保旧 D1 表在服务启动时补齐 upstream_response_headers，避免插入日志时报缺列。
+D1_TEXT_STAT_COLUMNS = {"upstream_response_headers"}
+
 is_debug = env_bool("DEBUG", False)
 
 # 根据数据库类型，动态创建信号量
@@ -172,6 +179,8 @@ async def _create_tables_d1():
             prompt_tokens INTEGER DEFAULT 0,
             completion_tokens INTEGER DEFAULT 0,
             total_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0,
+            cache_creation_tokens INTEGER DEFAULT 0,
             prompt_price REAL DEFAULT 0.0,
             completion_price REAL DEFAULT 0.0,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -185,6 +194,7 @@ async def _create_tables_d1():
             request_body TEXT,
             upstream_request_headers TEXT,
             upstream_request_body TEXT,
+            upstream_response_headers TEXT,
             upstream_response_body TEXT,
             response_body TEXT,
             raw_data_expires_at DATETIME
@@ -238,6 +248,31 @@ async def _create_tables_d1():
     for sql in create_sqls + index_sqls:
         await d1_client.execute(sql)
 
+    # D1 的 CREATE TABLE IF NOT EXISTS 不会给旧表补列；这里按启动迁移补齐 Prompt Caching 字段。
+    existing_columns = {
+        row.get("name")
+        for row in await d1_client.query_all("PRAGMA table_info(request_stats)")
+        if row.get("name")
+    }
+    for column_name in PROMPT_CACHE_STAT_COLUMNS:
+        if column_name not in existing_columns:
+            await d1_client.execute(
+                f"ALTER TABLE request_stats ADD COLUMN {column_name} INTEGER DEFAULT 0"
+            )
+            existing_columns.add(column_name)
+            logger.info("Added D1 request_stats column '%s' for Prompt Caching stats.", column_name)
+
+    for column_name in D1_TEXT_STAT_COLUMNS:
+        if column_name not in existing_columns:
+            # 修改原因：旧 D1 表不会自动拥有新加入的上游响应头列。
+            # 修改方式：启动时用 ALTER TABLE ADD COLUMN 补齐 TEXT 列。
+            # 目的：保证 D1 模式下日志插入、查询和清理都能使用 upstream_response_headers。
+            await d1_client.execute(
+                f"ALTER TABLE request_stats ADD COLUMN {column_name} TEXT"
+            )
+            existing_columns.add(column_name)
+            logger.info("Added D1 request_stats text column '%s'.", column_name)
+
 
 async def create_tables():
     """创建数据库表并执行简易列迁移"""
@@ -267,8 +302,12 @@ async def create_tables():
                             # 且 CockroachDB 对 JSONB 的兼容也可能返回 JSON。
                             col_type = column.type.compile(connection.dialect)
 
-                            # SQLite 允许 DEFAULT；Postgres/Cockroach 对 JSON 默认值较敏感，这里统一不加默认
-                            default = _get_default_sql(column.default) if db_type == "sqlite" else ""
+                            # Prompt Caching 字段需要跨数据库保持 DEFAULT 0；其它列沿用原有保守策略以避免 JSON 默认值兼容问题。
+                            if table_name == "request_stats" and column_name in PROMPT_CACHE_STAT_COLUMNS:
+                                default = " DEFAULT 0"
+                            else:
+                                # SQLite 允许 DEFAULT；Postgres/Cockroach 对 JSON 默认值较敏感，这里统一不加默认
+                                default = _get_default_sql(column.default) if db_type == "sqlite" else ""
 
                             # 使用标准的 ALTER TABLE 语法
                             qt = preparer.quote(table_name)
@@ -284,30 +323,139 @@ async def create_tables():
 
             await conn.run_sync(check_and_add_columns)
 
+            # MySQL 专属：将 body 列从 TEXT (64KB) 升级到 MEDIUMTEXT (16MB)
+            # v1.4.1 起默认保存请求/响应体，截断上限 100KB 超出 TEXT 容量
+            if db_type == "mysql":
+                _body_columns = [
+                    ("request_stats", "request_body"),
+                    ("request_stats", "upstream_request_body"),
+                    ("request_stats", "upstream_response_body"),
+                    ("request_stats", "response_body"),
+                ]
+
+                def _upgrade_text_to_mediumtext(connection):
+                    insp = inspect(connection)
+                    for tbl, col in _body_columns:
+                        for col_info in insp.get_columns(tbl):
+                            if col_info["name"] == col:
+                                col_type_str = str(col_info["type"]).upper()
+                                if col_type_str == "TEXT":
+                                    connection.execute(
+                                        text(
+                                            f"ALTER TABLE `{tbl}` MODIFY COLUMN `{col}` MEDIUMTEXT"
+                                        )
+                                    )
+                                    logger.info(
+                                        f"Upgraded column '{col}' in '{tbl}' from TEXT to MEDIUMTEXT."
+                                    )
+                                break
+
+                await conn.run_sync(_upgrade_text_to_mediumtext)
+
 
 # ============== 成本计算 ==============
 
-def get_current_model_prices(app, model_name: str):
+def _parse_price_str(price_str) -> tuple:
+    """解析 '输入,输出' 格式的价格字符串"""
+    parts = [p.strip() for p in str(price_str).split(",")]
+    try:
+        prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.0
+        completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 0.0
+    except (ValueError, TypeError):
+        return None
+    return prompt_price, completion_price
+
+
+def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: bool = True):
     """
-    根据当前配置偏好，返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）
-    
+    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price) 或 None。
+
+    匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
+    多个前缀同时匹配时，取最长的那个（最精确匹配）。
+    use_default=True 时，未命中前缀也会尝试 "default" 兜底。
+    """
+    if not model_price_dict or not model_name:
+        return None
+    # 前缀匹配：收集所有命中的 key，取最长的（最精确）
+    matched = [(k, model_price_dict[k]) for k in model_price_dict if k and k != "default" and model_name.startswith(k)]
+    if matched:
+        matched.sort(key=lambda x: len(x[0]), reverse=True)
+        return _parse_price_str(matched[0][1])
+    # 兜底 default
+    if use_default:
+        default_str = model_price_dict.get("default")
+        if default_str is not None:
+            return _parse_price_str(default_str)
+    return None
+
+
+def get_current_model_prices(app, model_name: str, provider_name: str = None):
+    """
+    根据配置返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）。
+
+    查找优先级：
+    1. 渠道级 provider.preferences.model_price（前缀匹配）
+    2. 全局 preferences.model_price（前缀匹配）
+    3. 都未配置 → 返回 (0, 0)，即不计费
+
     Args:
         app: FastAPI 应用实例
         model_name: 模型名称
-    
+        provider_name: 渠道名称（可选）
+
     Returns:
         (prompt_price, completion_price) 元组
     """
     from utils import safe_get
     try:
-        model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
-        price_str = next((model_price[k] for k in model_price.keys() if model_name and model_name.startswith(k)), model_price.get("default", "0.3,1"))
-        parts = [p.strip() for p in str(price_str).split(",")]
-        prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.3
-        completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 1.0
-        return prompt_price, completion_price
+        provider_prices = {}
+        global_prices = safe_get(app.state.config, 'preferences', 'model_price', default={})
+
+        # 1. 渠道级：去 model_prefix + 精确/前缀匹配（不用 default）
+        if provider_name:
+            providers = safe_get(app.state.config, 'providers', default=[])
+            for p in providers:
+                if p.get('provider') == provider_name:
+                    # 去掉渠道 model_prefix（如 [eve]claude-sonnet-4.5 → claude-sonnet-4.5）
+                    prefix = (p.get('model_prefix') or '').strip()
+                    if prefix and model_name.startswith(prefix):
+                        model_name = model_name[len(prefix):]
+                    provider_prices = safe_get(p, 'preferences', 'model_price', default={})
+                    result = _match_model_price(provider_prices, model_name, use_default=False)
+                    if result is not None:
+                        return result
+                    break
+
+        # 2. 全局精确/前缀匹配（不用 default）
+        result = _match_model_price(global_prices, model_name, use_default=False)
+        if result is not None:
+            return result
+
+        # 3. 外部价格库 fallback
+        try:
+            from .default_prices import lookup_price
+            result = lookup_price(model_name)
+            if result is not None:
+                return result
+        except Exception:
+            pass
+
+        # 4. 渠道 default 兜底
+        if provider_prices.get("default") is not None:
+            result = _parse_price_str(provider_prices["default"])
+            if result is not None:
+                return result
+
+        # 5. 全局 default 兜底
+        if global_prices.get("default") is not None:
+            result = _parse_price_str(global_prices["default"])
+            if result is not None:
+                return result
+
+        # 6. 都未配置，不计费
+        return 0.0, 0.0
     except Exception:
-        return 0.3, 1.0
+        return 0.0, 0.0
 
 
 async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None) -> float:
@@ -324,8 +472,8 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
             return 0.0
 
         sql = (
-            "SELECT COALESCE(SUM((COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.3) "
-            "+ COALESCE(completion_tokens, 0) * COALESCE(completion_price, 1.0)) / 1000000.0), 0.0) AS total_cost "
+            "SELECT COALESCE(SUM((COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.0) "
+            "+ COALESCE(completion_tokens, 0) * COALESCE(completion_price, 0.0)) / 1000000.0), 0.0) AS total_cost "
             "FROM request_stats WHERE 1=1"
         )
         params: list[Any] = []
@@ -342,7 +490,7 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
             return 0.0
 
     async with async_session_scope() as session:
-        expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.3) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 1.0)) / 1000000.0
+        expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.0) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 0.0)) / 1000000.0
         query = select(func.coalesce(func.sum(expr), 0.0))
         if filter_api_key:
             query = query.where(RequestStat.api_key == filter_api_key)
@@ -433,9 +581,10 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
             if get_model_prices_func:
                 prompt_price, completion_price = get_model_prices_func(current_info["model"])
             elif app:
-                prompt_price, completion_price = get_current_model_prices(app, current_info["model"])
+                prompt_price, completion_price = get_current_model_prices(
+                    app, current_info["model"], provider_name=current_info.get("provider"))
             else:
-                prompt_price, completion_price = 0.3, 1.0
+                prompt_price, completion_price = 0.0, 0.0
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
     except Exception:
@@ -617,7 +766,7 @@ async def query_token_usage(
     for row in rows:
         usage_dict = dict(row)
         api_key = usage_dict.get("api_key", "")
-        # Mask API key (show prefix like sk-...xyz)
+        # Mask API key (show prefix like zk-...xyz)
         if api_key and len(api_key) > 7:
             prefix = api_key[:7]
             suffix = api_key[-4:]

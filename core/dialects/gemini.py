@@ -9,9 +9,12 @@ Gemini 方言
 """
 
 import json
+import asyncio
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from core.models import RequestModel, Message, ContentItem
+from core.json_utils import json_loads, json_dumps_text
+from core.models import RequestModel, Message, ContentItem, ImageUrl
+from core.usage import extract_cache_usage
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -139,7 +142,7 @@ async def parse_gemini_request(
                     "type": "function",
                     "function": {
                         "name": fc.get("name"),
-                        "arguments": json.dumps(fc.get("args") or {}, ensure_ascii=False)
+                        "arguments": json_dumps_text(fc.get("args") or {}, ensure_ascii=False)
                     }
                 }
                 if part_signature:
@@ -153,7 +156,7 @@ async def parse_gemini_request(
                 messages.append(Message(
                     role="tool",
                     name=fr.get("name"),
-                    content=json.dumps(fr.get("response") or {}, ensure_ascii=False),
+                    content=json_dumps_text(fr.get("response") or {}, ensure_ascii=False),
                     tool_call_id=fr.get("name") # Gemini 通常用 name 匹配
                 ))
                 continue
@@ -167,10 +170,31 @@ async def parse_gemini_request(
                 inline = part["inlineData"]
                 mime_type = inline.get("mimeType", "image/png")
                 data = inline.get("data", "")
+                if mime_type.startswith("image/"):
+                    # 图片 → OAI 标准 image_url 格式（data URI）
+                    data_uri = f"data:{mime_type};base64,{data}"
+                    content_items.append(
+                        ContentItem(
+                            type="image_url",
+                            image_url=ImageUrl(url=data_uri),
+                        )
+                    )
+                else:
+                    # 非图片（音频/PDF等） → file 格式
+                    content_items.append(
+                        ContentItem(
+                            type="file",
+                            file={"mime_type": mime_type, "data": data},
+                        )
+                    )
+            elif "fileData" in part and isinstance(part.get("fileData"), dict):
+                file_data = part["fileData"]
+                mime_type = file_data.get("mimeType", "application/octet-stream")
+                file_uri = file_data.get("fileUri", "")
                 content_items.append(
                     ContentItem(
-                        type="image_url",
-                        image_url={"url": f"data:{mime_type};base64,{data}"},
+                        type="file",
+                        file={"mime_type": mime_type, "file_uri": file_uri},
                     )
                 )
 
@@ -246,13 +270,39 @@ async def render_gemini_response(
             parts.append({"thought": True, "text": reasoning})
 
         # 2. 文本内容 (Content)
-        content_text = msg.get("content") or ""
-        if isinstance(content_text, list):
-            content_text = "".join(
-                str(i.get("text", "")) for i in content_text if isinstance(i, dict)
-            )
-        if content_text:
-            parts.append({"text": content_text})
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            # 结构化 content list → Gemini parts
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append({"text": text})
+                elif item_type == "image_url":
+                    image_url = item.get("image_url")
+                    url = ""
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(image_url, str):
+                        url = image_url
+                    # 解析 data URI → inlineData
+                    if url.startswith("data:"):
+                        try:
+                            # data:image/png;base64,AAAA...
+                            header, b64data = url.split(",", 1)
+                            mime = header.split(":", 1)[1].split(";", 1)[0]
+                            parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
+                        except (ValueError, IndexError):
+                            # 解析失败，降级为 markdown 文本
+                            parts.append({"text": f"![image]({url})"})
+                    else:
+                        # 普通 URL，Gemini 用 fileData
+                        parts.append({"fileData": {"fileUri": url}})
+        elif content:
+            parts.append({"text": content})
 
         # 3. 工具调用 (Tool Calls)
         # 如果存在 tool_calls，Gemini 期望渲染为 functionCall parts
@@ -260,7 +310,7 @@ async def render_gemini_response(
         for i, tc in enumerate(tool_calls):
             fn = tc.get("function") or {}
             try:
-                args = json.loads(fn.get("arguments") or "{}")
+                args = json_loads(fn.get("arguments") or "{}")
             except:
                 args = {}
             
@@ -286,6 +336,15 @@ async def render_gemini_response(
             parts[-1]["thoughtSignature"] = msg.get("thoughtSignature")
 
     usage = canonical_response.get("usage") or {}
+    # Gemini 出口需要把 OpenAI prompt_tokens_details.cached_tokens 还原为 cachedContentTokenCount。
+    cache_usage = extract_cache_usage(usage)
+    usage_metadata = {
+        "promptTokenCount": usage.get("prompt_tokens", 0),
+        "candidatesTokenCount": usage.get("completion_tokens", 0),
+        "totalTokenCount": usage.get("total_tokens", 0),
+    }
+    if cache_usage["cached_tokens"] > 0:
+        usage_metadata["cachedContentTokenCount"] = cache_usage["cached_tokens"]
 
     return {
         "candidates": [
@@ -294,11 +353,7 @@ async def render_gemini_response(
                 "finishReason": "STOP",
             }
         ],
-        "usageMetadata": {
-            "promptTokenCount": usage.get("prompt_tokens", 0),
-            "candidatesTokenCount": usage.get("completion_tokens", 0),
-            "totalTokenCount": usage.get("total_tokens", 0),
-        },
+        "usageMetadata": usage_metadata,
     }
 
 
@@ -308,6 +363,8 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
 
     输入: "data: {...}\n\n"
     输出: "data: {...}\n\n" (Gemini candidates 格式)
+
+    支持 delta.content 为结构化 list（图片等）或普通 string。
     """
     if not isinstance(canonical_sse_chunk, str):
         return canonical_sse_chunk
@@ -320,16 +377,28 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
         return ""
 
     try:
-        canonical = json.loads(data_str)
+        canonical = json_loads(data_str)
     except json.JSONDecodeError:
         return canonical_sse_chunk
 
+    usage = canonical.get("usage")
     choices = canonical.get("choices") or []
     if not choices:
+        if isinstance(usage, dict):
+            # usage-only chunk 没有 choices；这里直接输出 Gemini usageMetadata，避免流式转换时丢失缓存命中字段。
+            cache_usage = extract_cache_usage(usage)
+            usage_metadata = {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            }
+            if cache_usage["cached_tokens"] > 0:
+                usage_metadata["cachedContentTokenCount"] = cache_usage["cached_tokens"]
+            return f"data: {json_dumps_text({'usageMetadata': usage_metadata}, ensure_ascii=False)}\n\n"
         return ""
 
     delta = choices[0].get("delta") or {}
-    content = delta.get("content") or ""
+    content = delta.get("content")
     reasoning = delta.get("reasoning_content") or ""
     thought_signature = delta.get("thoughtSignature")
 
@@ -344,15 +413,43 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
         ]
     }
 
-    if reasoning:
-        gemini_chunk["candidates"][0]["content"]["parts"].append(
-            {"thought": True, "text": reasoning}
-        )
-    if content:
-        gemini_chunk["candidates"][0]["content"]["parts"].append({"text": content})
+    parts = gemini_chunk["candidates"][0]["content"]["parts"]
 
-    if thought_signature and gemini_chunk["candidates"][0]["content"]["parts"]:
-        gemini_chunk["candidates"][0]["content"]["parts"][-1]["thoughtSignature"] = thought_signature
+    if reasoning:
+        parts.append({"thought": True, "text": reasoning})
+
+    if isinstance(content, list):
+        # 结构化 content items（图片等）→ Gemini parts
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+            if item_type == "text":
+                text = item.get("text", "")
+                if text:
+                    parts.append({"text": text})
+            elif item_type == "image_url":
+                image_url = item.get("image_url")
+                url = ""
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                elif isinstance(image_url, str):
+                    url = image_url
+                if url.startswith("data:"):
+                    try:
+                        header, b64data = url.split(",", 1)
+                        mime = header.split(":", 1)[1].split(";", 1)[0]
+                        parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
+                    except (ValueError, IndexError):
+                        parts.append({"text": f"![image]({url})"})
+                else:
+                    parts.append({"fileData": {"fileUri": url}})
+    elif content:
+        # 普通 string content
+        parts.append({"text": content})
+
+    if thought_signature and parts:
+        parts[-1]["thoughtSignature"] = thought_signature
 
     finish_reason = choices[0].get("finish_reason")
     if finish_reason:
@@ -360,13 +457,18 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
 
     usage = canonical.get("usage")
     if isinstance(usage, dict):
+        cache_usage = extract_cache_usage(usage)
         gemini_chunk["usageMetadata"] = {
             "promptTokenCount": usage.get("prompt_tokens", 0),
             "candidatesTokenCount": usage.get("completion_tokens", 0),
             "totalTokenCount": usage.get("total_tokens", 0),
         }
+        if cache_usage["cached_tokens"] > 0:
+            # 内容 chunk 和 usage chunk 都走同一个映射规则，目的在于保持流式 Gemini 输出格式一致。
+            gemini_chunk["usageMetadata"]["cachedContentTokenCount"] = cache_usage["cached_tokens"]
 
-    return f"data: {json.dumps(gemini_chunk, ensure_ascii=False)}\n\n"
+    json_data = json_dumps_text(gemini_chunk, ensure_ascii=False)
+    return f"data: {json_data}\n\n"
 
 
 def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
@@ -378,8 +480,15 @@ def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
         prompt = usage.get("promptTokenCount", 0)
         completion = usage.get("candidatesTokenCount", 0)
         total = usage.get("totalTokenCount", prompt + completion)
-        if prompt or completion:
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        # Gemini 的缓存命中字段在 usageMetadata.cachedContentTokenCount，需映射为统一 cached_tokens。
+        cache_usage = extract_cache_usage(usage)
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
     return None
 
 
@@ -467,6 +576,7 @@ def register() -> None:
             render_stream=render_gemini_stream,
             parse_usage=parse_gemini_usage,
             target_engine="gemini",
+            structured_stream=True,  # Gemini 原生支持 inlineData，保留结构化 content
             extract_token=extract_gemini_token,
             endpoints=[
                 # GET /v1beta/models - 列出模型

@@ -3,36 +3,38 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from core.request_helpers import merge_headers_case_insensitive, set_header_default_case_insensitive
+from core.handler import _filter_passthrough_headers
+from utils import apply_custom_headers, has_header_case_insensitive
 
 
-def test_merge_headers_case_insensitive_prefers_later_values():
-    headers = merge_headers_case_insensitive(
-        {"content-type": "application/json", "Authorization": "Bearer adapter"},
-        {"Content-Type": "application/problem+json", "x-test": "from-passthrough"},
-        {"CONTENT-TYPE": "application/xml", "authorization": "Bearer provider"},
-    )
-
-    assert [key for key in headers.keys() if key.lower() == "content-type"] == ["Content-Type"]
-    assert [key for key in headers.keys() if key.lower() == "authorization"] == ["Authorization"]
-    assert headers["Content-Type"] == "application/xml"
-    assert headers["Authorization"] == "Bearer provider"
-    assert headers["X-Test"] == "from-passthrough"
+def _count_header(headers: dict, name: str) -> int:
+    name_lower = name.lower()
+    return sum(1 for key in headers.keys() if str(key).lower() == name_lower)
 
 
+def test_apply_custom_headers_merges_case_insensitively():
+    headers = {"Content-Type": "application/json"}
 
-def test_set_header_default_case_insensitive_does_not_create_duplicate_content_type():
-    headers = merge_headers_case_insensitive({"content-type": "application/json"})
-    set_header_default_case_insensitive(headers, "Content-Type", "application/xml")
+    apply_custom_headers(headers, {"content-type": "application/json; charset=utf-8"})
 
-    assert [key for key in headers.keys() if key.lower() == "content-type"] == ["Content-Type"]
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert _count_header(headers, "content-type") == 1
+
+
+def test_passthrough_header_merge_does_not_duplicate_content_type():
+    headers = {"Content-Type": "application/json"}
+    original_headers = {
+        "content-type": "application/json",
+        "accept": "application/json",
+        "authorization": "Bearer secret",
+        "host": "example.com",
+    }
+
+    apply_custom_headers(headers, _filter_passthrough_headers(original_headers))
+
+    if not has_header_case_insensitive(headers, "Content-Type"):
+        headers["Content-Type"] = "application/json"
+
     assert headers["Content-Type"] == "application/json"
-
-
-
-def test_set_header_default_case_insensitive_sets_missing_header():
-    headers = merge_headers_case_insensitive({"authorization": "Bearer demo"})
-    set_header_default_case_insensitive(headers, "content-type", "application/json")
-
-    assert headers["Authorization"] == "Bearer demo"
-    assert headers["Content-Type"] == "application/json"
+    assert headers["accept"] == "application/json"
+    assert _count_header(headers, "content-type") == 1

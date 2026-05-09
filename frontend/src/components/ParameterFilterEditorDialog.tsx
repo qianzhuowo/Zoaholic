@@ -5,7 +5,7 @@ import { X, Plus, Trash2, CheckCircle2 } from 'lucide-react';
 type Mode = 'deny' | 'allow';
 
 export interface FilterRule {
-  modelKey: string; // 'all' 或具体模型名
+  modelKey: string;
   enabled: boolean;
   mode: Mode;
   use_defaults: boolean;
@@ -16,12 +16,9 @@ export interface FilterRule {
 export interface ParameterFilterEditorDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-
   availableModels: string[];
-
   /** 当前 provider.preferences.post_body_parameter_filter（可以是 object/list/null） */
   initialConfig: any;
-
   onSave: (config: any) => void;
 }
 
@@ -46,7 +43,7 @@ function asStringList(v: any): string[] {
 }
 
 function normalizeRule(modelKey: string, raw: any): FilterRule {
-  const obj = (raw && typeof raw === 'object') ? raw : {};
+  const obj = raw && typeof raw === 'object' ? raw : {};
   const mode = (String(obj.mode || 'deny').toLowerCase() === 'allow' ? 'allow' : 'deny') as Mode;
   const use_defaults = obj.use_defaults === undefined ? true : Boolean(obj.use_defaults);
   const enabled = obj.enabled === false ? false : true;
@@ -62,7 +59,6 @@ function normalizeRule(modelKey: string, raw: any): FilterRule {
 }
 
 function parseConfigToRules(cfg: any): { globalRule: FilterRule; modelRules: FilterRule[] } {
-  // list => global deny
   if (Array.isArray(cfg)) {
     return {
       globalRule: {
@@ -91,7 +87,6 @@ function parseConfigToRules(cfg: any): { globalRule: FilterRule; modelRules: Fil
     };
   }
 
-  // 结构化 global
   const hasGlobalShape = ['deny', 'allow', 'mode', 'enabled', 'use_defaults'].some(k => Object.prototype.hasOwnProperty.call(cfg, k));
   if (hasGlobalShape) {
     return {
@@ -100,7 +95,6 @@ function parseConfigToRules(cfg: any): { globalRule: FilterRule; modelRules: Fil
     };
   }
 
-  // all/* + per-model
   const globalRaw = (cfg.all ?? cfg['*']) ?? {};
   const globalRule = normalizeRule('all', globalRaw);
 
@@ -111,7 +105,6 @@ function parseConfigToRules(cfg: any): { globalRule: FilterRule; modelRules: Fil
     modelRules.push(normalizeRule(k, v));
   }
 
-  // 稳定排序
   modelRules.sort((a, b) => a.modelKey.localeCompare(b.modelKey));
 
   return { globalRule, modelRules };
@@ -130,8 +123,6 @@ function buildConfigFromRules(globalRule: FilterRule, modelRules: FilterRule[]):
   };
 
   const out: any = {};
-
-  // 始终写入 all（用户更容易理解结构）
   out.all = compactRule(globalRule);
 
   for (const r of modelRules) {
@@ -345,7 +336,7 @@ export function ParameterFilterEditorDialog({
     const { globalRule, modelRules } = parseConfigToRules(initialConfig);
     setGlobalRule(globalRule);
     setModelRules(modelRules);
-  }, [open]);
+  }, [open, initialConfig]);
 
   const addModelRule = () => {
     setModelRules(prev => {
@@ -375,10 +366,9 @@ export function ParameterFilterEditorDialog({
   };
 
   const handleSave = () => {
-    // 基础校验：modelKey 不能为空
     for (const r of modelRules) {
       if (!String(r.modelKey || '').trim()) {
-        alert('存在空的模型名规则，请填写或删除。');
+        window.alert('存在空的模型名规则，请填写或删除。');
         return;
       }
     }

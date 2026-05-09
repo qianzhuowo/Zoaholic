@@ -8,6 +8,7 @@
 import json
 import asyncio
 from collections import defaultdict
+from core.json_utils import json_dumps_text, json_loads
 from datetime import datetime, timedelta, timezone
 from time import time
 from urllib.parse import urlparse
@@ -30,19 +31,10 @@ from core.models import (
     ModerationRequest,
     EmbeddingRequest,
 )
-from core.request_helpers import (
-    build_attempt_provider_list,
-    merge_headers_case_insensitive,
-    set_header_default_case_insensitive,
-)
-from core.utils import (
-    get_engine,
-    provider_api_circular_list,
-    truncate_for_logging,
-)
+from core.utils import get_engine, provider_api_circular_list, truncate_for_logging, is_local_api_key
 from core.routing import get_right_order_providers
 from core.error_response import openai_error_response
-from utils import safe_get, error_handling_wrapper, is_local_api_key
+from utils import safe_get, error_handling_wrapper, apply_custom_headers, has_header_case_insensitive
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -58,6 +50,22 @@ def set_debug_mode(debug: bool):
     """设置调试模式"""
     global is_debug
     is_debug = debug
+
+
+def _fill_failure_provider_info(
+    current_info: Dict[str, Any],
+    provider_name: Optional[str],
+    request_model_name: str,
+) -> None:
+    # 修改原因：错误路径过去只记录成功请求中的 provider 和 model，导致 500 日志显示“未知”或“-”。
+    # 修改方式：在失败统计写入前统一补齐最后尝试的 provider、缺失的 provider_id 和缺失的 model。
+    # 目的：让不重试错误和所有重试耗尽错误都能在日志中定位最后失败渠道与请求模型。
+    provider_value = provider_name if provider_name else None
+    current_info["provider"] = provider_value
+    if not current_info.get("provider_id"):
+        current_info["provider_id"] = provider_value
+    if not current_info.get("model"):
+        current_info["model"] = request_model_name
 
 
 def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
@@ -154,7 +162,8 @@ async def process_request(
     endpoint: Optional[str] = None,
     role: Optional[str] = None,
     timeout_value: int = DEFAULT_TIMEOUT,
-    keepalive_interval: Optional[int] = None
+    keepalive_interval: Optional[int] = None,
+    force_api_key: Optional[str] = None
 ) -> Response:
     """
     向单个 provider 发送请求并处理响应
@@ -181,26 +190,44 @@ async def process_request(
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     
-    if is_local_api_key(provider['provider']):
+    if force_api_key:
+        api_key = force_api_key
+    elif is_local_api_key(provider['provider']):
         api_key = provider['provider']
     elif provider.get("api"):
         api_key = await provider_api_circular_list[provider['provider']].next(original_model)
     else:
         api_key = None
 
-    engine, stream_mode = get_engine(provider, endpoint, original_model)
+    # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
+    current_info_early = request_info_getter()
+    current_info_early["_used_api_key"] = api_key
 
-    if stream_mode is not None:
-        request.stream = stream_mode
+    engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
+
+    if stream_override is not None:
+        request.stream = stream_override
 
     channel_id = f"{provider['provider']}"
+    # 记录 provider 活跃度（内存级，O(1)）
+    try:
+        from routes.stats import record_provider_activity
+        record_provider_activity(channel_id)
+    except Exception:
+        pass
     if engine != "moderation":
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
     
-    url, headers, payload = await get_payload(request, engine, provider, api_key)
-    headers = merge_headers_case_insensitive(headers, safe_get(provider, "preferences", "headers", default={}))
+    # 提前计算代理，以便 get_payload 内部创建的裸 httpx.AsyncClient 也能走代理
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
+
+    from core.http import proxy_context
+    with proxy_context(proxy):
+        url, headers, payload = await get_payload(request, engine, provider, api_key)
+    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     
 
     current_info = request_info_getter()
@@ -213,10 +240,7 @@ async def process_request(
                                     if k.lower() not in ("authorization", "x-api-key", "api-key")}
             current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
             
-            # 使用深度截断，保留结构同时限制大小
-            # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-            upstream_payload = {k: v for k, v in payload.items() if k != 'file'}
-            current_info["upstream_request_body"] = await asyncio.to_thread(truncate_for_logging, upstream_payload)
+            # upstream_request_body 已移到 response.py fetch 层记录（能抓到 force_stream 等插件修改后的真实值）
         except Exception as e:
             logger.error(f"Error saving upstream request data: {str(e)}")
     # 确保日志中一定记录模型名（使用当前请求对象上的 model）
@@ -242,51 +266,111 @@ async def process_request(
     # 获取该渠道启用的插件列表
     enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
 
+    # 判断实际上游流式模式（stream_mode 核心逻辑）
+    client_wants_stream = bool(request.stream)
+    if stream_mode == "force_stream":
+        upstream_stream = True
+    elif stream_mode == "force_non_stream":
+        upstream_stream = False
+    else:  # auto
+        upstream_stream = client_wants_stream
+
+    # 强制流式时确保 payload 里也带 stream=True
+    if upstream_stream and not client_wants_stream and stream_mode == "force_stream":
+        payload = dict(payload)
+        payload["stream"] = True
+        logger.info(f"[stream_mode] force_stream: client=non-stream, upstream=stream, model={original_model}")
+    elif not upstream_stream and client_wants_stream and stream_mode == "force_non_stream":
+        payload = dict(payload)
+        payload["stream"] = False
+        logger.info(f"[stream_mode] force_non_stream: client=stream, upstream=non-stream, model={original_model}")
+
+    # Gemini/Vertex URL 适配：流式和非流式用不同端点
+    if upstream_stream and "generateContent" in url and "streamGenerateContent" not in url:
+        url = url.replace("generateContent", "streamGenerateContent")
+    elif not upstream_stream and "streamGenerateContent" in url:
+        url = url.replace("streamGenerateContent", "generateContent")
+
     try:
         async with app.state.client_manager.get_client(url, proxy) as client:
-            if request.stream:
+            if upstream_stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
                 wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator, channel_id, engine, request.stream,
-                    app.state.error_triggers, keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role,
-                    request_url=url,
-                    app=app,
-                )
-                response = LoggingStreamingResponse(
-                    wrapped_generator,
-                    media_type="text/event-stream",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug
-                )
-            else:
-                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
-                wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator, channel_id, engine, request.stream,
+                    generator, channel_id, engine, True,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,
                     last_message_role=last_message_role,
                     request_url=url,
                     app=app,
                 )
 
-                # 处理音频和其他二进制响应
-                if endpoint == "/v1/audio/speech":
-                    if isinstance(wrapped_generator, bytes):
-                        response = Response(content=wrapped_generator, media_type="audio/mpeg")
-                else:
-                    first_element = await anext(wrapped_generator)
-                    first_element = first_element.lstrip("data: ")
-                    decoded_element = await asyncio.to_thread(json.loads, first_element)
-                    encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
-                    
-                    # 非流式响应也需要记录统计
-                    async def non_stream_iter():
-                        yield encoded_element
-                    
+                if client_wants_stream:
+                    # 正常流式：直接转发
                     response = LoggingStreamingResponse(
-                        non_stream_iter(),
+                        wrapped_generator,
+                        media_type="text/event-stream",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug
+                    )
+                else:
+                    # force_stream：上游流式 → 拼装成非流式 JSON 返回客户端
+                    from .stream_convert import assemble_stream_to_json
+                    assembled = await assemble_stream_to_json(wrapped_generator)
+
+                    async def force_stream_iter():
+                        yield json.dumps(assembled, ensure_ascii=False)
+
+                    response = LoggingStreamingResponse(
+                        force_stream_iter(),
                         media_type="application/json",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug
+                    )
+            else:
+                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
+                wrapped_generator, first_response_time = await error_handling_wrapper(
+                    generator, channel_id, engine, False,
+                    app.state.error_triggers, keepalive_interval=keepalive_interval,
+                    last_message_role=last_message_role,
+                    request_url=url,
+                    app=app,
+                )
+
+                if not client_wants_stream:
+                    # 正常非流式
+                    if endpoint == "/v1/audio/speech":
+                        if isinstance(wrapped_generator, bytes):
+                            response = Response(content=wrapped_generator, media_type="audio/mpeg")
+                    else:
+                        async def non_stream_iter():
+                            first_element = await anext(wrapped_generator)
+                            yield first_element
+                            async for item in wrapped_generator:
+                                yield item
+
+                        response = LoggingStreamingResponse(
+                            non_stream_iter(),
+                            media_type="application/json",
+                            current_info=current_info,
+                            app=app,
+                            debug=is_debug
+                        )
+                else:
+                    # force_non_stream：上游非流式 → 拆成 SSE 返回客户端
+                    from .stream_convert import convert_json_to_sse
+                    first_element = await anext(wrapped_generator)
+
+                    async def force_non_stream_iter():
+                        if isinstance(first_element, dict):
+                            async for sse_chunk in convert_json_to_sse(first_element, original_model):
+                                yield sse_chunk
+                        else:
+                            yield first_element
+
+                    response = LoggingStreamingResponse(
+                        force_non_stream_iter(),
+                        media_type="text/event-stream",
                         current_info=current_info,
                         app=app,
                         debug=is_debug
@@ -338,7 +422,7 @@ def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> D
     }
 
 
-async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
+async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
     """
     透传模式的流式响应处理
     
@@ -347,6 +431,9 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
     注意：使用特殊的超时配置，read timeout 设置为 None 以支持
     Google Search grounding 等需要长时间处理的操作。
     """
+    from .response import _log_upstream_request
+    _log_upstream_request(url, payload)
+    
     # 为流式请求创建特殊的超时配置
     # read timeout 设置为 None，因为：
     # 1. Gemini 使用 Google Search 时，搜索可能需要较长时间
@@ -359,53 +446,37 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
         pool=10.0,
     )
     
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        from core.plugins.interceptors import apply_response_interceptors
         error_message = await check_response(response, "passthrough_stream")
         if error_message:
-            yield error_message
+            error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
+            yield error_message            
             return
         
-        # 使用 aiter_bytes 替代 aiter_text，然后手动解码
-        # 这样可以更好地处理边界情况和避免编码问题导致流中断
-        buffer = b""
-        async for raw_chunk in response.aiter_bytes():
-            # 合并缓冲区和新数据
-            buffer += raw_chunk
-            
-            # 尝试解码为文本
-            try:
-                # 使用 errors="replace" 避免编码错误导致流终止
-                text = buffer.decode("utf-8", errors="replace")
-                buffer = b""  # 成功解码后清空缓冲区
-                if text:
-                    yield text
-            except UnicodeDecodeError:
-                # 如果解码失败（可能是不完整的 UTF-8 序列），保留缓冲区等待更多数据
-                # 但如果缓冲区太大，强制输出避免内存问题
-                if len(buffer) > 10 * 1024:  # 10KB
-                    text = buffer.decode("utf-8", errors="replace")
-                    buffer = b""
-                    if text:
-                        yield text
-        
-        # 处理剩余的缓冲区数据
-        if buffer:
-            text = buffer.decode("utf-8", errors="replace")
+        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界），
+        # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
+        async for text in response.aiter_text():
             if text:
+                text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
                 yield text
 
 
-async def _fetch_passthrough_response(client, url, headers, payload, timeout):
+async def _fetch_passthrough_response(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
     """
     透传模式的非流式响应处理
     
     直接转发上游 JSON 响应，不做任何格式转换
     """
+    from .response import _log_upstream_request
+    _log_upstream_request(url, payload)
+    
     import time as _time
     t0 = _time.time()
+    from core.plugins.interceptors import apply_response_interceptors
     
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     t1 = _time.time()
     logger.debug(f"[passthrough] json.dumps took {t1-t0:.3f}s")
     
@@ -417,21 +488,41 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout):
         write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
         pool=10.0,
     )
-    
+
+    # 快路径：未启用响应插件时，直接按文本流转发。
+    # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
+    if not enabled_plugins:
+        async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
+            t2 = _time.time()
+            logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
+
+            error_message = await check_response(response, "passthrough_non_stream")
+            if error_message:
+                yield error_message
+                return
+
+            async for text_chunk in response.aiter_text():
+                if text_chunk:
+                    yield text_chunk
+        return
+
     response = await client.post(url, headers=headers, content=json_payload, timeout=request_timeout)
     t2 = _time.time()
     logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
-    
+
     error_message = await check_response(response, "passthrough_non_stream")
     if error_message:
+        error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
         yield error_message
         return
-    
+
     response_bytes = await response.aread()
     t3 = _time.time()
     logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
-    
-    yield response_bytes.decode("utf-8")
+
+    result = response_bytes.decode("utf-8")
+    result = await apply_response_interceptors(result, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
+    yield result
 
 
 async def _passthrough_error_wrapper(generator, channel_id):
@@ -538,21 +629,54 @@ async def process_request_passthrough(
     else:
         api_key = None
 
-    engine, stream_mode = get_engine(provider, endpoint, original_model)
-    if stream_mode is not None:
-        request.stream = stream_mode
+    # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
+    current_info_early = request_info_getter()
+    current_info_early["_used_api_key"] = api_key
+
+    engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
+    if stream_override is not None:
+        request.stream = stream_override
 
     channel = get_channel(engine)
     adapter = (channel.passthrough_adapter if channel else None) or (channel.request_adapter if channel else None)
     if not adapter:
         raise ValueError(f"Unknown engine: {engine}")
 
-    url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
+    # 提前计算代理，以便 adapter 内部创建的裸 httpx.AsyncClient 也能走代理
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)
 
-    headers: Dict[str, Any] = merge_headers_case_insensitive(adapter_headers or {})
-    headers = merge_headers_case_insensitive(headers, _filter_passthrough_headers(passthrough_ctx.original_headers))
-    headers = merge_headers_case_insensitive(headers, safe_get(provider, "preferences", "headers", default={}))
-    set_header_default_case_insensitive(headers, "Content-Type", "application/json")
+    from core.http import proxy_context
+    with proxy_context(proxy):
+        url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
+
+    # ── 透传 URL 路径修正 ──
+    # passthrough_adapter 返回的 URL 对应方言的"主端点"（如 Claude 的 /messages）。
+    # 当入口请求是子路径（如 /v1/messages/count_tokens）时，需要追加路径后缀。
+    #
+    # 后缀从端点的 passthrough_root 显式配置计算，不依赖 adapter URL 的路径结构，
+    # 因此无论 base_url 配成什么样（如 https://proxy.com/anthropic/v1）都能正确工作。
+    if endpoint and passthrough_ctx.dialect_id:
+        from core.dialects.registry import get_dialect as _get_dialect
+        _dialect = _get_dialect(passthrough_ctx.dialect_id)
+        if _dialect:
+            # 查找匹配当前 endpoint 的透传根路径（显式配置，不依赖路由模板字符串）
+            _root = None
+            for _ep in _dialect.endpoints:
+                if _ep.passthrough_root and endpoint.startswith(_ep.passthrough_root):
+                    if _root is None or len(_ep.passthrough_root) > len(_root):
+                        _root = _ep.passthrough_root
+            # 用 passthrough_root 计算后缀：
+            # 例如 root="/v1/messages", endpoint="/v1/messages/count_tokens" → suffix="/count_tokens"
+            if _root and len(endpoint) > len(_root):
+                _suffix = endpoint[len(_root):]  # 如 "/count_tokens"
+                url = url.rstrip("/") + _suffix
+
+    headers: Dict[str, Any] = dict(adapter_headers or {})
+    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers))
+    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
+    if not has_header_case_insensitive(headers, "Content-Type"):
+        headers["Content-Type"] = "application/json"
 
     payload = apply_passthrough_modifications(
         passthrough_ctx.original_payload,
@@ -562,7 +686,7 @@ async def process_request_passthrough(
         original_model=original_model,
     )
 
-    # 渠道级透传 payload 修饰（把“渠道特殊逻辑”收敛在各自 channel 文件内）
+    # 渠道级透传 payload 修饰（把"渠道特殊逻辑"收敛在各自 channel 文件内）
     if channel and getattr(channel, "passthrough_payload_adapter", None):
         payload = await channel.passthrough_payload_adapter(
             payload,
@@ -591,9 +715,7 @@ async def process_request_passthrough(
             if k.lower() not in ("authorization", "x-api-key", "api-key", "x-goog-api-key")
         }
         current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
-        upstream_payload = {k: v for k, v in payload.items() if k != "file"}
-        # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-        current_info["upstream_request_body"] = await asyncio.to_thread(truncate_for_logging, upstream_payload)
+        # upstream_request_body 已移到 response.py fetch 层记录
 
     if getattr(request, "model", None):
         current_info["model"] = request.model
@@ -613,47 +735,111 @@ async def process_request_passthrough(
     proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
     proxy = safe_get(provider, "preferences", "proxy", default=proxy)
 
+    # 透传路径的 stream_mode 处理（与非透传路径对齐）
+    client_wants_stream = bool(request.stream)
+    if stream_mode == "force_stream":
+        upstream_stream = True
+    elif stream_mode == "force_non_stream":
+        upstream_stream = False
+    else:
+        upstream_stream = client_wants_stream
+
+    if upstream_stream and not client_wants_stream and stream_mode == "force_stream":
+        payload = dict(payload) if not isinstance(payload, dict) else {**payload}
+        payload["stream"] = True
+        logger.info(f"[stream_mode/passthrough] force_stream: client=non-stream, upstream=stream, model={original_model}")
+    elif not upstream_stream and client_wants_stream and stream_mode == "force_non_stream":
+        payload = dict(payload) if not isinstance(payload, dict) else {**payload}
+        payload["stream"] = False
+        logger.info(f"[stream_mode/passthrough] force_non_stream: client=stream, upstream=non-stream, model={original_model}")
+
+    # Gemini/Vertex URL 适配
+    if upstream_stream and "generateContent" in url and "streamGenerateContent" not in url:
+        url = url.replace("generateContent", "streamGenerateContent")
+    elif not upstream_stream and "streamGenerateContent" in url:
+        url = url.replace("streamGenerateContent", "generateContent")
+
     try:
         async with app.state.client_manager.get_client(url, proxy) as client:
             last_message_role = safe_get(request, "messages", -1, "role", default=None)
 
-            if request.stream:
+            if upstream_stream:
                 # 透传模式：使用原始流处理，不做格式转换
                 generator = _fetch_passthrough_stream(
-                    client, url, headers, payload, timeout_value
+                    client, url, headers, payload, timeout_value,
+                    engine=engine, model=request.model,
+                    enabled_plugins=enabled_plugins,
                 )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
                     generator, channel_id
                 )
-                response = LoggingStreamingResponse(
-                    wrapped_generator,
-                    media_type="text/event-stream",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug,
-                )
+
+                if client_wants_stream:
+                    response = LoggingStreamingResponse(
+                        wrapped_generator,
+                        media_type="text/event-stream",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+                else:
+                    # force_stream 透传：上游流式 → 拼装成非流式 JSON
+                    from .stream_convert import assemble_stream_to_json
+                    assembled = await assemble_stream_to_json(wrapped_generator)
+
+                    async def force_stream_passthrough_iter():
+                        yield json.dumps(assembled, ensure_ascii=False)
+
+                    response = LoggingStreamingResponse(
+                        force_stream_passthrough_iter(),
+                        media_type="application/json",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
             else:
                 # 透传模式：使用原始响应处理，不做格式转换
                 generator = _fetch_passthrough_response(
-                    client, url, headers, payload, timeout_value
+                    client, url, headers, payload, timeout_value,
+                    engine=engine, model=request.model,
+                    enabled_plugins=enabled_plugins,
                 )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
                     generator, channel_id
                 )
 
-                async def passthrough_iter():
-                    async for chunk in wrapped_generator:
-                        yield chunk
+                if client_wants_stream:
+                    # force_non_stream 透传：上游非流式 → 拆成 SSE
+                    from .stream_convert import convert_json_to_sse
 
-                response = LoggingStreamingResponse(
-                    passthrough_iter(),
-                    media_type="application/json",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug,
-                )
+                    async def force_non_stream_passthrough_iter():
+                        raw = b""
+                        async for chunk in wrapped_generator:
+                            raw += chunk if isinstance(chunk, bytes) else chunk.encode()
+                        async for sse_line in convert_json_to_sse(raw):
+                            yield sse_line
+
+                    response = LoggingStreamingResponse(
+                        force_non_stream_passthrough_iter(),
+                        media_type="text/event-stream",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+                else:
+                    async def passthrough_iter():
+                        async for chunk in wrapped_generator:
+                            yield chunk
+
+                    response = LoggingStreamingResponse(
+                        passthrough_iter(),
+                        media_type="application/json",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
 
             current_info["first_response_time"] = first_response_time
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
@@ -725,30 +911,79 @@ class ModelRequestHandler:
         scheduling_algorithm: str,
         advance_cursor: bool = True,
     ) -> List[Dict[str, Any]]:
-        """构建单次请求的尝试列表。
+        """构造单次请求真正用于尝试的渠道列表。
 
-        目标：
-        - 保留加权轮询展开后的“槽位分布”，以便跨请求维持首选渠道占比
-        - 在单次请求内对 provider 去重，避免同一渠道被重复尝试
+        保留权重展开后的起点选择，但在一次请求内部去掉重复 provider，
+        避免同一渠道因为权重槽位被重复尝试很多次。
         """
         if not providers:
             return []
 
-        provider_names = [str(provider.get("provider", "")) for provider in providers]
-        has_duplicate_slots = len(set(provider_names)) < len(provider_names)
-        should_rotate = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
+        async def build_unique_group(provider_slots: List[Dict[str, Any]], cursor_key: str) -> List[Dict[str, Any]]:
+            """在一个优先级组内执行原有轮转和去重逻辑。"""
+            # 修改原因：虚拟路由的 fallback 组间顺序必须稳定，但同组仍要保留原权重槽位轮转语义。
+            # 修改方式：把旧的全列表轮转和去重逻辑抽成组内函数，普通路由仍以整列表作为唯一分组。
+            # 目的：不改 handler 重试循环，只确保它收到的尝试列表已经符合链条降级顺序。
+            if not provider_slots:
+                return []
 
-        start_index = 0
-        if should_rotate and advance_cursor:
-            async with self.locks[request_model_name]:
-                self.last_provider_indices[request_model_name] = (
-                    self.last_provider_indices[request_model_name] + 1
-                ) % len(providers)
-                start_index = self.last_provider_indices[request_model_name]
+            provider_names = [provider.get("provider") for provider in provider_slots]
+            has_duplicate_slots = len(set(provider_names)) != len(provider_names)
+            should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
 
-        attempt_providers = build_attempt_provider_list(providers, start_index=start_index)
+            start_index = 0
+            if should_rotate_slots:
+                async with self.locks[cursor_key]:
+                    if advance_cursor:
+                        self.last_provider_indices[cursor_key] = (
+                            self.last_provider_indices[cursor_key] + 1
+                        ) % len(provider_slots)
+                    elif self.last_provider_indices[cursor_key] < 0:
+                        self.last_provider_indices[cursor_key] = 0
+                    start_index = self.last_provider_indices[cursor_key] % len(provider_slots)
 
-        return attempt_providers
+            ordered_slots = provider_slots[start_index:] + provider_slots[:start_index]
+
+            unique_group: List[Dict[str, Any]] = []
+            seen_provider_names = set()
+            for provider in ordered_slots:
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_group.append(provider)
+            return unique_group
+
+        has_virtual_priorities = any(
+            provider.get("_virtual_route_provider") and "_virtual_priority" in provider
+            for provider in providers
+        )
+        if not has_virtual_priorities:
+            return await build_unique_group(providers, request_model_name)
+
+        # 修改原因：路由阶段会按 _virtual_priority 生成权重槽位，但旧构造逻辑可能因槽位轮转从 fallback 组开始。
+        # 修改方式：构造阶段再次按 _virtual_priority 拆组，只在组内轮转和去重，再按 priority 升序合并。
+        # 目的：让后续 while 重试循环自然先尝试完当前 chain 节点，再降级到下一个节点。
+        priority_groups: Dict[int, List[Dict[str, Any]]] = {}
+        for provider in providers:
+            try:
+                priority = int(provider.get("_virtual_priority", 0) or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            priority_groups.setdefault(priority, []).append(provider)
+
+        unique_providers: List[Dict[str, Any]] = []
+        seen_provider_names = set()
+        for priority in sorted(priority_groups.keys()):
+            cursor_key = f"{request_model_name}::virtual_priority::{priority}"
+            for provider in await build_unique_group(priority_groups[priority], cursor_key):
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_providers.append(provider)
+
+        return unique_providers
 
     async def request_model(
         self,
@@ -758,7 +993,11 @@ class ModelRequestHandler:
         endpoint: Optional[str] = None,
         dialect_id: Optional[str] = None,
         original_payload: Optional[Dict[str, Any]] = None,
-   original_headers: Optional[Dict[str, str]] = None,
+        original_headers: Optional[Dict[str, str]] = None,
+        passthrough_only: bool = False,
+        override_providers: Optional[List[Dict[str, Any]]] = None,
+        force_api_key: Optional[str] = None,
+        override_auto_retry: Optional[bool] = None,
     ) -> Response:
         """
         处理模型请求
@@ -771,50 +1010,71 @@ class ModelRequestHandler:
             dialect_id: 入口方言 ID（原生路由传入）
             original_payload: 原始 native 请求体（透传用）
             original_headers: 原始请求头（透传用）
+            override_auto_retry: override provider 测试是否允许按候选列表自动重试
             
         Returns:
             响应对象
         """
         config = self.app.state.config
         request_model_name = request_data.model
-        
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
-        # 调度算法优先级：API Key preferences > 全局 preferences > 默认值
-        scheduling_algorithm = safe_get(
-            config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
-            default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-        )
+        # ── override 模式：跳过用户限速和全局路由（测试/直接调用场景） ──
+        if override_providers is not None:
+            matching_providers = override_providers
+            num_matching_providers = len(matching_providers)
+            if num_matching_providers == 0:
+                raise HTTPException(status_code=400, detail="No providers specified for test")
+            scheduling_algorithm = "fixed_priority"
+            # 修改原因：普通单渠道测试应只测当前渠道，但虚拟路由测试需要按 chain 候选继续尝试后续节点。
+            # 修改方式：保留默认不重试；只有调用方显式传 override_auto_retry=True 时才开启 override provider 列表内重试。
+            # 目的：不改变现有渠道测试语义，同时让虚拟模型测试能覆盖完整 fallback 链条。
+            auto_retry = bool(override_auto_retry)
+            role = "test"
+        else:
+            # ── 正常路径：用户限速 + 全局路由 ──
+            try:
+                final_api_key = self.app.state.api_list[api_index]
+                await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=429, detail="Too many requests")
 
-        # 估算请求 token 数
-        request_total_tokens = 0
-        if request_data and isinstance(request_data, RequestModel):
-            for message in request_data.messages:
-                if message.content and isinstance(message.content, str):
-                    request_total_tokens += len(message.content)
-        request_total_tokens = int(request_total_tokens / 4)
+            if not safe_get(config, 'api_keys', api_index, 'model'):
+                raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
-        matching_providers = await get_right_order_providers(
-            request_model_name, config, api_index, scheduling_algorithm, 
-            self.app, request_total_tokens=request_total_tokens
-        )
-        matching_providers = await self._build_attempt_providers(
-            matching_providers,
-            request_model_name=request_model_name,
-            scheduling_algorithm=scheduling_algorithm,
-            advance_cursor=True,
-        )
-        num_matching_providers = len(matching_providers)
+            scheduling_algorithm = safe_get(
+                config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
+                default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+            )
+
+            request_total_tokens = 0
+            if request_data and isinstance(request_data, RequestModel):
+                for message in request_data.messages:
+                    if message.content and isinstance(message.content, str):
+                        request_total_tokens += len(message.content)
+            request_total_tokens = int(request_total_tokens / 4)
+
+            matching_providers = await get_right_order_providers(
+                request_model_name, config, api_index, scheduling_algorithm, 
+                self.app, request_total_tokens=request_total_tokens
+            )
+            matching_providers = await self._build_attempt_providers(
+                matching_providers,
+                request_model_name=request_model_name,
+                scheduling_algorithm=scheduling_algorithm,
+                advance_cursor=True,
+            )
+            num_matching_providers = len(matching_providers)
+
+            auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+            role = safe_get(
+                config, 'api_keys', api_index, "role", 
+                default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
+            )
 
         status_code = 500
         error_message = None
-
-        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
-        role = safe_get(
-            config, 'api_keys', api_index, "role", 
-            default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
-        )
 
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
@@ -864,47 +1124,6 @@ class ModelRequestHandler:
             tmp_retry_count = total_slots * 2
             return min(tmp_retry_count, max_retry_limit)
 
-        def _is_image_generation_model(*model_names: Any) -> bool:
-            for model_name in model_names:
-                if not isinstance(model_name, str):
-                    continue
-                model_lower = model_name.lower()
-                if "-image" in model_lower or "image-generation" in model_lower:
-                    return True
-            return False
-
-        def _should_skip_retry_for_deterministic_502(
-            request_model: str,
-            upstream_model: str,
-            message: str,
-        ) -> bool:
-            error_text = (message or "").lower()
-
-            if _is_image_generation_model(request_model, upstream_model):
-                if (
-                    "no image was generated" in error_text
-                    or "image generation failed" in error_text
-                    or "returned no image" in error_text
-                    or "gemini returned empty response" in error_text
-                ):
-                    return True
-
-            deterministic_policy_markers = (
-                "content management policy",
-                "content policy",
-                "content filter",
-                "filtered due to the prompt",
-                "prompt was flagged",
-                "gemini blocked",
-                "blocked: safety",
-                "blocked by safety",
-                "safety policy",
-                "safety settings",
-                "policy violation",
-                "responsible ai policy",
-            )
-            return any(marker in error_text for marker in deterministic_policy_markers)
-
         retry_count = _calc_retry_count(matching_providers)
         max_attempts = num_matching_providers + retry_count
 
@@ -924,16 +1143,17 @@ class ModelRequestHandler:
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model_name]
-            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-                error_message = "All API keys are rate limited and stop auto retry!"
-                if num_matching_providers == 1:
-                    break
-                else:
-                    continue
+            if not override_providers and provider_name in provider_api_circular_list:
+                if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+                    error_message = "All API keys are rate limited and stop auto retry!"
+                    if num_matching_providers == 1:
+                        break
+                    else:
+                        continue
 
             original_request_model = (original_model, request_data.model)
             
-            # 处理本地 sk-/zk- 代理
+            # 处理本地聚合器 Key 代理
             if is_local_api_key(provider_name) and provider_name in self.app.state.api_list:
                 local_provider_api_index = self.app.state.api_list.index(provider_name)
                 local_provider_scheduling_algorithm = safe_get(
@@ -984,6 +1204,14 @@ class ModelRequestHandler:
                         request_model=request_model_name,
                     )
 
+                # passthrough_only 前置拦截：如果该端点仅支持透传，
+                # 但当前 provider 与入口方言不匹配（透传未启用），
+                # 直接跳过该 provider，不发送任何真实上游请求。
+                if passthrough_only and not (passthrough_ctx and passthrough_ctx.enabled):
+                    error_message = f"Endpoint {endpoint} requires passthrough mode, but provider {provider_name} is not compatible"
+                    status_code = 501
+                    continue
+
                 process_fn = process_request_passthrough if (passthrough_ctx and passthrough_ctx.enabled) else process_request
                 response = await process_fn(
                     request_data, provider, background_tasks, self.app,
@@ -996,7 +1224,8 @@ class ModelRequestHandler:
                 ) if process_fn is process_request_passthrough else await process_request(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
-                    endpoint, role, local_timeout_value, keepalive_interval
+                    endpoint, role, local_timeout_value, keepalive_interval,
+                    force_api_key=force_api_key
                 )
 
                 # 成功时记录重试路径和重试次数
@@ -1072,6 +1301,17 @@ class ModelRequestHandler:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
+                # ── Key Rules 统一错误处理 ──
+                from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
+                _key_rules = resolve_key_rules(provider.get("preferences") or {})
+                _rule_result = match_key_rules(_key_rules, status_code, error_message) if _key_rules else None
+
+                # 规则中的 remap: 把上游非标准状态码映射为标准码
+                if _rule_result and _rule_result.get("remap"):
+                    _mapped = _rule_result["remap"]
+                    if 100 <= _mapped <= 599:
+                        status_code = _mapped
+
                 exclude_error_rate_limit = [
                     "BrokenResourceError",
                     "Proxy connection timed out",
@@ -1088,13 +1328,78 @@ class ModelRequestHandler:
 
                 channel_id = provider['provider']
 
-                if (self.app.state.channel_manager.cooldown_period > 0 
+                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
+                # 避免并发场景下 after_next_current() 返回其他请求的 key，
+                # 导致冷却/禁用操作作用在错误的 key 上。
+                _current_info_for_key = self.request_info_getter()
+                current_api = _current_info_for_key.get("_used_api_key") or \
+                    await provider_api_circular_list[channel_id].after_next_current()
+
+                should_consider_channel_cooldown = (
+                    self.app.state.channel_manager.cooldown_period > 0
+                    and override_providers is None
                     and num_matching_providers > 1
-                    and all(error not in error_message for error in exclude_error_rate_limit)):
+                    and all(error not in error_message for error in exclude_error_rate_limit)
+                )
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                try:
+                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_enabled_items_count()
+                except Exception:
+                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_items_count()
+
+                key_rule_disabled_current = False
+                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
+                if _rule_result and current_api:
+                    _duration = _rule_result.get("duration", 0)
+                    _reason = _rule_result.get("reason", "key_rule")
+                    if _duration == -1:
+                        # 永久禁用
+                        await provider_api_circular_list[channel_id].set_auto_disabled(
+                            current_api, duration=0, reason=_reason
+                        )
+                        key_rule_disabled_current = True
+                    elif _duration > 0:
+                        # 修改原因：旧逻辑只在多 key 时冷却，单渠道单 key 依赖原有重试行为；但多渠道降级时，最后一个失败 key 必须能让渠道被判定为耗尽。
+                        # 修改方式：多 key 仍按旧规则冷却；当渠道级降级条件成立时，最后一个 key 也执行冷却。
+                        # 目的：既保留单渠道单 key 的旧行为，又让多渠道虚拟路由能在所有 key 不可用后再进入 fallback。
+                        if (
+                            (api_key_count_before_rule > 1 or should_consider_channel_cooldown)
+                            and all(error not in error_message for error in exclude_error_rate_limit)
+                        ):
+                            await provider_api_circular_list[channel_id].set_auto_disabled(
+                                current_api, duration=_duration, reason=_reason
+                            )
+                            key_rule_disabled_current = True
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                # 修改原因：旧逻辑先冷却渠道再冷却 key，会把同渠道剩余 key 从候选列表中埋没。
+                # 修改方式：key 级规则执行后，再检查该渠道是否还有启用 key。
+                # 目的：只有当前渠道所有 key 都不可用时，才进入渠道级冷却和候选列表重建。
+                try:
+                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
+                except Exception:
+                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
+
+                should_rebuild_after_channel_cooldown = (
+                    should_consider_channel_cooldown
+                    and (api_key_count <= 0 or not key_rule_disabled_current)
+                )
+
+                if should_rebuild_after_channel_cooldown:
+                    # 修改原因：只有当前错误确实触发 key 禁用时，才应等待当前渠道所有 key 耗尽；未命中 key_rules 时继续留在当前渠道会反复取到同一 key。
+                    # 修改方式：key 已被禁用时沿用“启用 key 数量为 0 才冷却渠道”；key 未被禁用时立即走渠道级冷却并重建候选列表。
+                    # 目的：既保留多 key 渠道先耗尽 key 的行为，又避免无匹配 key_rules 的渠道在虚拟路由中循环重试。
                     await self.app.state.channel_manager.exclude_model(channel_id, request_model_name)
                     matching_providers = await get_right_order_providers(
-                        request_model_name, config, api_index, scheduling_algorithm, 
+                        request_model_name, config, api_index, scheduling_algorithm,
                         self.app, request_total_tokens=request_total_tokens
+                    )
+                    matching_providers = await self._build_attempt_providers(
+                        matching_providers,
+                        request_model_name=request_model_name,
+                        scheduling_algorithm=scheduling_algorithm,
+                        advance_cursor=False,
                     )
                     last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
@@ -1103,18 +1408,9 @@ class ModelRequestHandler:
                     max_attempts = num_matching_providers + retry_count
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
-
-                cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                # 仅统计“启用”的 key 数量，避免禁用 key 造成误判
-                try:
-                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
-                except Exception:
-                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
-                current_api = await provider_api_circular_list[channel_id].after_next_current()
-
-                if (cooling_time > 0 and api_key_count > 1
-                    and all(error not in error_message for error in exclude_error_rate_limit)):
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
+                # 当 key 被冷却但渠道仍有可用 key 时：不做 exclude_model，也不回退 index。
+                # index 正常前进，通过 max_attempts 的 modulo 循环回来时 circular_list 自动取下一个 key。
+                # 不能 index = current_index，否则 index 永远到不了 max_attempts，死循环。
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
                 if (current_api 
@@ -1159,29 +1455,30 @@ class ModelRequestHandler:
                 if retry_path:
                     retry_path[-1]["status_code"] = status_code
 
-                retryable_statuses = {429, 500, 502, 503, 504}
-                explicitly_non_retryable_statuses = {401, 403, 404, 422}
-                skip_retry_for_deterministic_502 = (
-                    status_code == 502 and _should_skip_retry_for_deterministic_502(
-                        request_model_name,
-                        original_model,
-                        error_message,
-                    )
-                )
-                if skip_retry_for_deterministic_502:
-                    logger.info(
-                        f"Skip retry for deterministic 502 failure: provider={channel_id}, "
-                        f"model={request_model_name}, error={error_message}"
-                    )
-
                 retry_enabled = (
                     auto_retry
-                    and status_code in retryable_statuses
-                    and status_code not in explicitly_non_retryable_statuses
-                    and not skip_retry_for_deterministic_502
+                    and (
+                        status_code not in [400, 413, 401, 403]
+                        or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'
+                    )
                 )
 
-                # 若还有剩余尝试次数，则进行自动重试（仅保留 429/500/502/503/504；确定性 502 不重试）
+                # 修改原因：Key Rules 新增 retry 三态，需要在默认硬编码判断之后提供按规则覆盖的能力。
+                # 修改方式：只有 _rule_result.retry 为 bool 时覆盖 retry_enabled，缺失时保持默认结果。
+                # 目的：支持 retry=true 强制允许重试、retry=false 强制禁止重试，同时不影响旧配置。
+                retry_enabled = apply_key_rule_retry_override(_rule_result, retry_enabled)
+
+                # 特定场景禁止重试：
+                # 1. 图像生成失败（no image was generated）通常是内容审核或模型能力问题，重试无效且增加负载
+                if "no image was generated" in error_message.lower():
+                    retry_enabled = False
+                
+                # 2. 图像模型遇到 429，通常意味着高并发触发了严格配额，重试会放大负载
+                is_image_model = "-image" in request_model_name.lower() or "image-generation" in request_model_name.lower()
+                if is_image_model and status_code == 429:
+                    retry_enabled = False
+
+                # 若还有剩余尝试次数，则进行自动重试
                 if retry_enabled and index < max_attempts:
                     if status_code in {429, 500, 502, 503, 504}:
                         base_delay = 0.5 if status_code == 429 else 0.2
@@ -1197,6 +1494,10 @@ class ModelRequestHandler:
                 # 不重试：直接返回本次错误
                 # 失败时也记录重试信息和统计
                 current_info = self.request_info_getter()
+                # 修改原因：不重试错误会直接写入失败统计，过去没有补齐渠道和模型字段。
+                # 修改方式：在写 retry_path 和失败状态前调用统一 helper，写入最后尝试 provider 与请求模型。
+                # 目的：避免直接返回 500 或其他错误时日志 provider 显示“未知”、model 显示“-”。
+                _fill_failure_provider_info(current_info, provider_name, request_model_name)
                 if retry_path:
                     current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
                 current_info["retry_count"] = current_retry_count
@@ -1218,7 +1519,10 @@ class ModelRequestHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["status_code"] = status_code
-        current_info["provider"] = None
+        # 修改原因：所有重试失败时旧逻辑把 provider 写成 None，丢失最后一次尝试的渠道。
+        # 修改方式：复用失败字段补全 helper，只在 provider_id 和 model 缺失时补写它们。
+        # 目的：让重试耗尽后的日志至少保留最后失败渠道和原始请求模型。
+        _fill_failure_provider_info(current_info, provider_name, request_model_name)
         # 记录最终的重试信息
         if retry_path:
             current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)

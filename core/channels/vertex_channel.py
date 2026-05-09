@@ -29,6 +29,11 @@ from ..utils import (
     ThreadSafeCircularList,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
 
@@ -47,7 +52,7 @@ async def format_gemini_image_message(image_url: str) -> dict:
     return {
         "inlineData": {
             "mimeType": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -69,7 +74,7 @@ async def format_claude_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -230,8 +235,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     else:
         location = gemini1
 
-    if "google-vertex-ai" in provider.get("base_url", "") or any(global_model in original_model for global_model in global_models):
-        url = provider.get("base_url").rstrip('/') + "/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+    vertex_base_url = provider.get("base_url", "")
+    if vertex_base_url.endswith('#'):
+        url = vertex_base_url[:-1].rstrip('/')
+    elif "google-vertex-ai" in vertex_base_url or any(global_model in original_model for global_model in global_models):
+        url = vertex_base_url.rstrip('/') + "/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
             LOCATION=await location.next(),
             PROJECT_ID=project_id,
             MODEL_ID=original_model,
@@ -266,6 +274,34 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                 elif item.type == "image_url" and provider.get("image", True):
                     image_message = await format_gemini_image_message(item.image_url.url)
                     content.append(image_message)
+                elif item.type == "file":
+                    if getattr(item.file, "file_uri", None):
+                        content.append({
+                            "fileData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "fileUri": item.file.file_uri
+                            }
+                        })
+                    elif getattr(item.file, "url", None):
+                        from ..file_utils import get_base64_file, parse_data_uri
+                        data_uri, mime_type = await get_base64_file(item.file.url)
+                        if data_uri.startswith("data:"):
+                            _, b64_data = parse_data_uri(data_uri)
+                        else:
+                            b64_data = data_uri
+                        content.append({
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": b64_data
+                            }
+                        })
+                    elif getattr(item.file, "data", None):
+                        content.append({
+                            "inlineData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "data": item.file.data
+                            }
+                        })
         elif msg.content:
             content = [{"text": msg.content}]
         elif msg.content is None:
@@ -495,14 +531,6 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                 "includeThoughts": True,
             }
 
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
-
     return url, headers, normalize_vertex_payload(payload)
 
 
@@ -553,6 +581,27 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                 elif item.type == "image_url" and provider.get("image", True):
                     image_message = await format_claude_image_message(item.image_url.url)
                     content.append(image_message)
+                elif item.type == "file":
+                    b64_data = ""
+                    mime_type = item.file.mime_type or "application/octet-stream"
+                    if getattr(item.file, "data", None):
+                        b64_data = item.file.data
+                    elif getattr(item.file, "url", None):
+                        from ..file_utils import get_base64_file, parse_data_uri
+                        data_uri, mime_type = await get_base64_file(item.file.url)
+                        if data_uri.startswith("data:"):
+                            _, b64_data = parse_data_uri(data_uri)
+                        else:
+                            b64_data = data_uri
+                    if b64_data:
+                        content.append({
+                            "type": "document" if not mime_type.startswith("image/") else "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": b64_data,
+                            }
+                        })
         else:
             content = msg.content
             tool_calls = msg.tool_calls
@@ -569,7 +618,7 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -685,7 +734,7 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     url = url.replace("streamRawPredict", "rawPredict")
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_vertex_claude_response")
@@ -694,19 +743,38 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
     
-    # Vertex Claude 格式解析与标准 Claude 类似
+    # Vertex Claude 格式解析与标准 Claude 类似；缓存字段也要按 Claude 口径补入 prompt_tokens。
     content = safe_get(response_json, "content", 0, "text")
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
-    total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cached_tokens"]
+        + cache_usage["cache_creation_tokens"]
+    )
+    output_tokens = usage.get("output_tokens", 0)
+    total_tokens = prompt_tokens + (output_tokens or 0)
     role = safe_get(response_json, "role")
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+        **cache_usage,
+    )
+    if content:
+        mark_content_start()
 
     from ..utils import generate_no_stream_response
     yield await generate_no_stream_response(
         timestamp, model, content=content, role=role,
-        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens,
+        # Vertex Claude 非流式输出同样需要缓存字段，供下游 OpenAI 或方言转换使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -715,14 +783,14 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
     from ..log_config import logger
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
+        mark_adapter_metrics_managed()
         revicing_function_call = False
         function_full_response = "{"
         need_function_call = False
@@ -730,11 +798,10 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # Vertex 流式响应可能出现 Gemini 风格 cachedContentTokenCount，需跨 JSON 片段暂存到最终 usage chunk。
+        cachedContentTokenCount = 0
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line and '\"finishReason\": \"' in line:
                     is_finish = True
@@ -747,11 +814,16 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
                 if is_finish and '\"totalTokenCount\": ' in line:
                     json_data = parse_json_safely( "{" + line + "}")
                     totalTokenCount = json_data.get('totalTokenCount', 0)
+                if is_finish and '\"cachedContentTokenCount\": ' in line:
+                    # Vertex Gemini 风格流式 usage 可能分散在多行 JSON 片段中，这里单独采集缓存命中字段。
+                    json_data = parse_json_safely( "{" + line + "}")
+                    cachedContentTokenCount = json_data.get('cachedContentTokenCount', 0)
 
                 if line and '\"text\": \"' in line and is_finish == False:
                     try:
-                        json_data = await asyncio.to_thread(json.loads, "{" + line.strip().rstrip(",") + "}")
+                        json_data = json_loads("{" + line.strip().rstrip(",") + "}")
                         content = json_data.get('text', '')
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
@@ -767,16 +839,30 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
                     function_full_response += line
 
         if need_function_call:
-            function_call = await asyncio.to_thread(json.loads, function_full_response)
+            function_call = json_loads(function_full_response)
             function_call_name = function_call["name"]
             function_call_id = function_call["id"]
+            mark_content_start()
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
             yield sse_string
-            function_full_response = await asyncio.to_thread(json.dumps, function_call["input"])
+            function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
             yield sse_string
 
-        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+        merge_usage(
+            prompt_tokens=promptTokenCount,
+            completion_tokens=candidatesTokenCount,
+            total_tokens=totalTokenCount,
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
+        )
+        sse_string = await generate_sse_response(
+            timestamp, model, None, None, None, None, None,
+            totalTokenCount, promptTokenCount, candidatesTokenCount,
+            # Vertex 流式最终 usage chunk 要保留 cachedContentTokenCount 映射后的 cached_tokens。
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line

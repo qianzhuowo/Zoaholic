@@ -39,13 +39,6 @@ Zoaholic 不再强迫所有请求转换为 OpenAI 格式。网关内置了智能
 - `claude_thinking`: 将 Claude 模型请求（后缀 `-thinking`）自动转换为带有 `<thinking>` 预填充的推理流，并在响应流中正确分离 `reasoning_content` 和普通 `content`。
 - `gemini_empty_retry`: 解决 Gemini 偶尔返回空响应的问题。
 - `claude_tools`: 增强 Claude 的函数调用能力。
-- `proxy_error_shield`: 将上游错误统一改写为反代错误，避免向调用方泄露供应商/渠道细节。
-
-### 🩺 可观测性与健康检查
-
-- 内置 `EventLoopBlockWatchdog`，可持续监控事件循环阻塞。
-- 提供 `/healthz` 与 `/readyz` 健康检查接口，便于接入 Docker / PaaS / K8s 探针。
-- 多模态输入标准见 `docs/multimodal-schema.md`。
 
 ### ⚖️ 企业级负载均衡
 继承自 uni-api 的强大核心引擎（`core/routing.py`）：
@@ -75,9 +68,14 @@ Render / Aiven / Railway 等平台通常会提供 `DATABASE_URL`。
 ```bash
 docker run --rm -p 8000:8000 \
   -e PORT=8000 \
+  -e CONFIG_STORAGE=db \
   -e DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require" \
   ghcr.io/qianzhuowo/zoaholic:latest
 ```
+
+如果你使用仓库中的 `docker-compose.yml`，默认会将配置保存到数据库（`CONFIG_STORAGE=db`），并把 SQLite 数据库持久化到 `./data/stats.db`。这样可以避免 Docker 单文件挂载 `api.yaml` 带来的写入问题。
+
+如果你坚持使用文件模式，请挂载目录，再通过 `API_YAML_PATH` 指向目录内的文件；不建议直接把单个 `api.yaml` 绑定到容器内的 `/home/api.yaml`。
 
 ### 3）首次初始化
 
@@ -96,7 +94,7 @@ docker run --rm -p 8000:8000 \
 
 ---
 
-## 线上部署（Render 等）需要填哪些环境变量？
+## 线上部署需要填哪些环境变量？
 
 下面列的是“线上部署最常用、最容易踩坑的变量”。
 
@@ -112,7 +110,7 @@ docker run --rm -p 8000:8000 \
 
 | 变量 | 默认 | 说明 |
 |---|---:|---|
-| `CONFIG_STORAGE` | `file` | 配置来源策略：`auto\|db\|file\|url`。默认 `file`（`api.yaml` 为权威配置源）；Docker / 云平台建议显式设为 `db`，避免单文件挂载问题。 |
+| `CONFIG_STORAGE` | `file` | 配置来源策略：`auto\|db\|file\|url`。默认 `file`（`api.yaml` 为权威配置源）；云平台可用 `auto`（文件权威并同步写入 DB）或 `db`（DB 权威）。 |
 | `SYNC_CONFIG_TO_FILE` | `false` | 是否把配置同步写回 `api.yaml`。线上通常文件系统只读/临时，建议保持 `false`。 |
 | `JWT_SECRET` | （可选） | 管理控制台 JWT 签名密钥。**不设置也能用**：首次 `/setup` 会自动生成并持久化到 DB（`admin_user.jwt_secret`），后续重启复用。出于安全考虑仍建议在部署阶段直接设置环境变量。 |
 | `DISABLE_DATABASE` | `false` | 是否关闭数据库。线上一般不要关（否则无法配置入库/无法统计）。 |
@@ -135,7 +133,7 @@ docker run --rm -p 8000:8000 \
 | `CONFIG_YAML` | YAML 文本 | 直接用环境变量提供配置种子。 |
 | `CONFIG_YAML_BASE64` | base64(YAML) | 推荐方式：把 `api.yaml` base64 后放这里，首次启动会写入 DB。 |
 | `CONFIG_URL` | `https://.../api.yaml` | 从 URL 拉取配置种子（首次写入 DB）。 |
-| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `sk-...` / `zk-...` | 当没有任何配置来源时，生成一个“最小可启动配置”（只含管理员 key），便于先启动再进控制台完善配置。 |
+| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `zk-...` | 当没有任何配置来源时，生成一个“最小可启动配置”（只含管理员 key），便于先启动再进控制台完善配置。 |
 | `DEBUG` | `true/false` | 开启调试日志。 |
 
 ---
@@ -155,12 +153,6 @@ Zoaholic 支持把配置（原 `api.yaml`）持久化到数据库：
 - 可选 `CONFIG_STORAGE=db`（云平台/多实例场景，以 DB 为权威）
   - DB 有配置：启动优先从 DB 读取
   - DB 无配置：会从 `CONFIG_YAML(_BASE64)` / `CONFIG_URL` / `api.yaml` 读取一次作为“种子”，并写入 DB
-
-- Docker / Compose 推荐：
-  - 默认使用 `CONFIG_STORAGE=db`
-  - 仅挂载 `./data:/home/data` 持久化 SQLite / 数据库文件
-  - 不再推荐默认单文件挂载 `./api.yaml:/home/api.yaml`
-  - 若必须使用 file 模式，请先在宿主机手动创建 `./api.yaml` 文件；否则 Docker 可能创建同名目录，导致配置读写失败
 
 配置入库后：
 
@@ -190,7 +182,7 @@ python main.py
 
 ### 1）为什么服务启动后 /v1 接口 403？
 
-`/v1/*` 是网关接口，默认必须带 API Key（`Authorization: Bearer sk-/zk-...` 或 `x-api-key`）。
+`/v1/*` 是网关接口，默认必须带 API Key（`Authorization: Bearer zk-...` 或 `x-api-key`）。
 请先在控制台配置 `api_keys`。
 
 ### 2）我不想填 JWT_SECRET 行不行？

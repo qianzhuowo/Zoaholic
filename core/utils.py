@@ -6,6 +6,7 @@ import httpx
 import base64
 import random
 import string
+
 import asyncio
 import traceback
 from time import time
@@ -16,19 +17,77 @@ from httpx_socks import AsyncProxyTransport
 from urllib.parse import urlparse, urlunparse
 
 from .log_config import logger
-from .request_helpers import merge_headers_case_insensitive, set_header_default_case_insensitive
+from .json_utils import json_dumps_text, json_loads
+from .file_utils import split_data_uri_prefix_and_data, extract_base64_data, fetch_url_content
+from .usage import build_openai_usage
+
+# 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
+# sk- 是历史前缀，zk- 是新版本前缀，两者都需要兼容
+LOCAL_API_KEY_PREFIXES = ("sk-", "zk-")
+
+def is_local_api_key(name: str) -> bool:
+    """
+    判断一个 provider 名称是否为本地 API Key（聚合器 Key）。
+    本地 Key 以 sk-（历史）或 zk-（新版）开头。
+    """
+    return name.startswith(LOCAL_API_KEY_PREFIXES)
 
 
-def get_header_case_insensitive(headers: dict[str, str], key: str, default=None):
-    """大小写无关地读取请求头。"""
-    normalized_key = str(key or "").strip().lower()
-    for existing_key, value in (headers or {}).items():
-        if str(existing_key).strip().lower() == normalized_key:
-            return value
-    return default
+async def generate_chunked_image_md(
+    image_data: str,
+    timestamp: int,
+    model: str,
+    thought_signature: str = None,
+    chunk_size: int = 16384,
+    mime_type: str = "image/png",
+):
+    """
+    将较大的图片 data URI 或 base64 转为 Markdown，并分块流式输出 SSE。
 
+    注意：
+    - 不先构造完整 markdown 大字符串，避免高并发时额外内存分配和事件循环阻塞。
+    - image_data 可以是完整 data URI，也可以是纯 base64 字符串。
+    """
+    data_uri_prefix, raw_image_data = split_data_uri_prefix_and_data(image_data, mime_type)
+
+    prefix = "\n\n![image](" + data_uri_prefix
+    suffix = ")"
+
+    first_chunk_capacity = max(1, chunk_size - len(prefix))
+    first_chunk = prefix + raw_image_data[:first_chunk_capacity]
+    sse_string = await generate_sse_response(
+        timestamp,
+        model,
+        content=first_chunk,
+        thought_signature=thought_signature,
+    )
+    yield sse_string
+
+    sent = first_chunk_capacity
+    if sent < len(raw_image_data):
+        await asyncio.sleep(0)
+
+    while sent < len(raw_image_data):
+        chunk_content = raw_image_data[sent:sent + chunk_size]
+        sse_string = await generate_sse_response(
+            timestamp,
+            model,
+            content=chunk_content,
+        )
+        yield sse_string
+        sent += len(chunk_content)
+        if sent < len(raw_image_data):
+            await asyncio.sleep(0)
+
+    sse_string = await generate_sse_response(
+        timestamp,
+        model,
+        content=suffix,
+    )
+    yield sse_string
 
 def get_model_dict(provider):
+
     """
     构建模型别名到上游模型名的映射字典。
     
@@ -38,13 +97,19 @@ def get_model_dict(provider):
     - 字典：`{upstream: alias}` 格式，key 是上游模型名，value 是对外展示的别名
       例：`- gemini-2.5-pro: my-alias` → upstream="gemini-2.5-pro", alias="my-alias"
     
-    如果 provider 配置了 model_prefix，会同时生成：
-    - 带前缀的别名 -> 上游模型（用于模型列表展示和带前缀请求匹配）
-    - 不带前缀的别名 -> 上游模型（用于不带前缀请求的路由匹配）
+    如果 provider 配置了 model_prefix，只生成带前缀的对外别名 -> 上游模型。
+    无前缀请求是否能命中带前缀渠道，由 routing.py 的 pool_sharing 显式控制。
+    这样做的目的，是避免未开启 pool_sharing 的旧渠道被无前缀模型名误命中。
     
     Returns:
         dict: {alias: upstream_model} 映射
     """
+    if provider.get("_virtual_route_provider") and isinstance(provider.get("_model_dict_cache"), dict):
+        # 修改原因：虚拟模型临时 provider 会保留原渠道的 model_prefix，但请求链路中有部分代码会调用 get_model_dict。
+        # 修改方式：对带 _virtual_route_provider 标记的临时 provider，优先返回已注入虚拟名映射的运行时缓存副本。
+        # 目的：确保 request.model 为虚拟模型名时，所有渠道实现都能解析到真实上游模型名。
+        return dict(provider["_model_dict_cache"])
+
     model_dict = {}
     prefix = provider.get('model_prefix', '').strip()
     
@@ -54,10 +119,15 @@ def get_model_dict(provider):
         
     for model in provider['model']:
         if isinstance(model, str):
-            # 字符串模型：别名和上游都是自己
-            if prefix:
+            # 字符串模型：别名和上游都是自己。
+            # 修改原因：model_prefix 渠道默认只能暴露带前缀外部名；无前缀共享必须由 pool_sharing 单独开启。
+            # 修改方式：普通模型只写入 prefix+model；通配符 "*" 是路由标记，不加前缀，保持既有透传能力。
+            if model == "*":
+                model_dict[model] = model
+            elif prefix:
                 model_dict[f"{prefix}{model}"] = model  # 带前缀别名 -> 上游
-            model_dict[model] = model  # 原始名 -> 上游（用于路由匹配）
+            else:
+                model_dict[model] = model  # 无前缀渠道：原始名 -> 上游
             
         if isinstance(model, dict):
             # dict 模型格式: {upstream: alias}
@@ -66,11 +136,34 @@ def get_model_dict(provider):
             for upstream, alias in model.items():
                 alias_str = str(alias)
                 upstream_str = str(upstream)
+                # 修改原因：保持 model_dict 的 key 始终为对外模型名，value 始终为上游原始名。
+                # 修改方式：有前缀时只写入带前缀别名；无前缀时写入原别名。
+                # 目的：让 pool_sharing 成为无前缀路由池共享的唯一入口。
                 if prefix:
                     model_dict[f"{prefix}{alias_str}"] = upstream_str  # 带前缀别名 -> 上游
-                model_dict[alias_str] = upstream_str  # 原始别名 -> 上游（用于路由匹配）
+                else:
+                    model_dict[alias_str] = upstream_str  # 无前缀渠道：别名 -> 上游
                 
     return model_dict
+
+
+def resolve_base_url(base_url: str, suffix: str) -> str:
+    """解析 base_url 并拼接后缀。
+
+    当 base_url 以 '#' 结尾时，去掉 '#' 后直接使用该地址，不拼接 suffix。
+    这允许用户通过在 base_url 末尾加 '#' 来精确指定完整的请求地址。
+
+    示例:
+        resolve_base_url("https://example.com/v1", "/chat/completions")
+        → "https://example.com/v1/chat/completions"
+
+        resolve_base_url("https://example.com/v10/chat#", "/chat/completions")
+        → "https://example.com/v10/chat"
+    """
+    if base_url.endswith('#'):
+        return base_url[:-1].rstrip('/')
+    return base_url.rstrip('/') + suffix
+
 
 class BaseAPI:
     def __init__(
@@ -79,6 +172,22 @@ class BaseAPI:
     ):
         if api_url == "":
             api_url = "https://api.openai.com/v1/chat/completions"
+
+        # 如果 URL 以 '#' 结尾，表示用户希望直接使用该地址，不做任何路径拼接
+        if api_url.endswith('#'):
+            fixed_url = api_url[:-1].rstrip('/')
+            self.source_api_url = fixed_url
+            self.base_url = fixed_url
+            self.v1_url = fixed_url
+            self.v1_models = fixed_url
+            self.chat_url = fixed_url
+            self.image_url = fixed_url
+            self.audio_transcriptions = fixed_url
+            self.moderations = fixed_url
+            self.embeddings = fixed_url
+            self.audio_speech = fixed_url
+            return
+
         self.source_api_url: str = api_url
         parsed_url = urlparse(self.source_api_url)
         # print("parsed_url", parsed_url)
@@ -90,19 +199,13 @@ class BaseAPI:
                 before_v1 = before_v1 + "/"
         else:
             before_v1 = ""
-
-        def _ensure_leading_slash(path: str) -> str:
-            if not path.startswith("/"):
-                return "/" + path
-            return path
-
         self.base_url: str = urlunparse(parsed_url[:2] + ("",) + ("",) * 3)
         self.v1_url: str = urlunparse(parsed_url[:2]+ (before_v1,) + ("",) * 3)
         if "v1/messages" in parsed_url.path:
-            # 注意：path 必须以 / 开头，否则 urlunparse 会生成无效 URL（缺少 /）
+            # path 必须以 / 开头，否则 urlunparse 会生成无效 URL
             self.v1_models: str = urlunparse(parsed_url[:2] + ("/v1/models",) + ("",) * 3)
         else:
-            self.v1_models: str = urlunparse(parsed_url[:2] + (_ensure_leading_slash(before_v1 + "models"),) + ("",) * 3)
+            self.v1_models: str = urlunparse(parsed_url[:2] + (before_v1 + "models",) + ("",) * 3)
 
         if "v1/responses" in parsed_url.path:
             self.chat_url: str = api_url
@@ -127,43 +230,6 @@ class BaseAPI:
             self.v1_url = api_url
             self.chat_url = api_url
             self.embeddings = urlunparse(parsed_url[:2] + (before_v1 + "/v1beta/embeddings",) + ("",) * 3)
-
-
-def build_claude_thinking_payload(thinking=None, *, budget_tokens=None, thinking_type=None):
-    """构造 Claude thinking 配置，仅保留有值字段。"""
-
-    payload = {}
-
-    if thinking is not None:
-        if isinstance(thinking, dict):
-            source_budget = thinking.get("budget_tokens")
-            source_type = thinking.get("type")
-        else:
-            source_budget = getattr(thinking, "budget_tokens", None)
-            source_type = getattr(thinking, "type", None)
-
-        if source_budget is not None:
-            payload["budget_tokens"] = source_budget
-        if source_type is not None and str(source_type).strip():
-            payload["type"] = str(source_type).strip()
-
-    if budget_tokens is not None:
-        payload["budget_tokens"] = budget_tokens
-    if thinking_type is not None and str(thinking_type).strip():
-        payload["type"] = str(thinking_type).strip()
-
-    return payload or None
-
-
-def apply_claude_thinking_constraints(payload: dict) -> None:
-    """应用 Claude thinking 模式下的采样参数约束。"""
-
-    if not isinstance(payload, dict):
-        return
-
-    payload["temperature"] = 1
-    payload.pop("top_p", None)
-    payload.pop("top_k", None)
 
 def get_tools_mode(provider) -> str:
     """
@@ -230,7 +296,10 @@ def get_engine(provider, endpoint=None, original_model=""):
     if "stream" in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}):
         stream = safe_get(provider, "preferences", "post_body_parameter_overrides", "stream")
 
-    return engine, stream
+    # stream_mode: auto(默认) / force_stream / force_non_stream
+    stream_mode = safe_get(provider, "preferences", "stream_mode", default="auto")
+
+    return engine, stream, stream_mode
 
 def get_proxy(proxy, client_config = {}):
     if proxy:
@@ -252,7 +321,7 @@ def get_proxy(proxy, client_config = {}):
 
 async def update_initial_model(provider):
     try:
-        engine, stream_mode = get_engine(provider, endpoint=None, original_model="")
+        engine, stream_mode, _ = get_engine(provider, endpoint=None, original_model="")
         # print("engine", engine, provider)
         api_url = provider['base_url']
         api = provider['api']
@@ -459,6 +528,90 @@ def parse_rate_limit(limit_string):
 
     return limits
 
+
+# ==================== 运行时自动禁用 Key 持久化 ====================
+import os as _os
+import threading as _threading
+
+_RT_DISABLED_FILE = _os.path.join(
+    _os.getenv("DATA_DIR", "/home/data"), "runtime_disabled_keys.json"
+)
+_rt_save_lock = _threading.Lock()
+
+
+def _save_all_auto_disabled():
+    """将所有渠道的运行时自动禁用状态持久化到 JSON 文件。"""
+    try:
+        snapshot = {}
+        for pname, clist in provider_api_circular_list.items():
+            if clist.auto_disabled_info:
+                entries = {}
+                for k, info in clist.auto_disabled_info.items():
+                    cooling_val = clist.cooling_until.get(k, 0)
+                    entries[k] = {
+                        "cooling_until": None if cooling_val == float('inf') else cooling_val,
+                        "disabled_at": info.get("disabled_at", 0),
+                        "duration": info.get("duration", 0),
+                        "reason": info.get("reason", ""),
+                    }
+                snapshot[pname] = entries
+        with _rt_save_lock:
+            _os.makedirs(_os.path.dirname(_RT_DISABLED_FILE), exist_ok=True)
+            tmp = _RT_DISABLED_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            _os.replace(tmp, _RT_DISABLED_FILE)
+    except Exception as e:
+        logger.debug(f"[auto_disable_persist] save failed: {e}")
+
+
+def load_auto_disabled_snapshot() -> dict:
+    """从文件加载运行时自动禁用快照。返回 {provider_name: {key: {...}}}"""
+    try:
+        if _os.path.exists(_RT_DISABLED_FILE):
+            with open(_RT_DISABLED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.debug(f"[auto_disable_persist] load failed: {e}")
+    return {}
+
+
+def restore_auto_disabled():
+    """启动时从持久化文件恢复所有渠道的自动禁用状态。
+
+    应在 provider_api_circular_list 初始化完成后调用。
+    已过期的非永久禁用条目会被跳过。
+    """
+    snapshot = load_auto_disabled_snapshot()
+    if not snapshot:
+        return
+    now = time()
+    restored = 0
+    for pname, entries in snapshot.items():
+        clist = provider_api_circular_list.get(pname)
+        if not clist:
+            continue
+        for k, info in entries.items():
+            if k not in clist.items:
+                continue
+            cooling = info.get("cooling_until")
+            if cooling is None:
+                cooling = float('inf')  # 永久禁用
+            elif cooling <= now:
+                continue  # 已过期，跳过
+            clist.cooling_until[k] = cooling
+            clist.auto_disabled_info[k] = {
+                "disabled_at": info.get("disabled_at", 0),
+                "duration": info.get("duration", 0),
+                "reason": info.get("reason", ""),
+            }
+            restored += 1
+    if restored:
+        logger.info(f"[auto_disable_persist] Restored {restored} disabled key(s) from snapshot")
+
+
 class ThreadSafeCircularList:
     def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin", provider_name=None, disabled_keys=None):
         self.provider_name = provider_name
@@ -486,6 +639,7 @@ class ThreadSafeCircularList:
         self.cooling_until = defaultdict(float)
         self.rate_limits = {}
         self.reordering_task = None
+        self.auto_disabled_info = {}  # key -> {"disabled_at": float, "duration": int, "reason": str}
 
         if isinstance(rate_limit, dict):
             for rate_limit_model, rate_limit_value in rate_limit.items():
@@ -543,6 +697,61 @@ class ThreadSafeCircularList:
             # self.requests[item] = []
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
+    async def set_auto_disabled(self, item: str, duration: int = 0, reason: str = ""):
+        """自动禁用某个 Key。
+
+        通过设置 cooling_until 实现，复用现有的 is_rate_limited 判断链路。
+        duration=0 表示永久禁用（直到手动恢复或进程重启）。
+        duration>0 表示禁用指定秒数后自动恢复。
+
+        Args:
+            item: API key
+            duration: 禁用时长（秒），0 表示永久
+            reason: 禁用原因（用于日志和 API 展示）
+        """
+        if item is None:
+            return
+        now = time()
+        async with self.lock:
+            if duration > 0:
+                self.cooling_until[item] = now + duration
+            else:
+                self.cooling_until[item] = float('inf')
+            self.auto_disabled_info[item] = {
+                "disabled_at": now,
+                "duration": duration,
+                "reason": reason,
+            }
+        logger.warning(
+            f"[auto_disable] Key {item} disabled for provider {self.provider_name}, "
+            f"duration={'permanent' if duration == 0 else f'{duration}s'}, reason: {reason}"
+        )
+        _save_all_auto_disabled()
+
+    async def clear_auto_disabled(self, item: str):
+        """手动恢复一个被自动禁用的 Key，清除冷却和元数据。"""
+        async with self.lock:
+            self.cooling_until[item] = 0.0
+            self.auto_disabled_info.pop(item, None)
+        _save_all_auto_disabled()
+
+    async def get_auto_disabled_keys(self) -> list:
+        """返回当前被自动禁用的 Key 列表及其剩余时间。
+
+        同时清理已自然过期的记录。
+        """
+        now = time()
+        async with self.lock:
+            expired = [k for k in self.auto_disabled_info if now >= self.cooling_until.get(k, 0)]
+            for k in expired:
+                self.auto_disabled_info.pop(k, None)
+            result = []
+            for item, info in self.auto_disabled_info.items():
+                until = self.cooling_until.get(item, 0)
+                remaining = -1 if until == float('inf') else max(0, int(until - now))
+                result.append({"key": item, "remaining_seconds": remaining, "duration": info.get("duration", 0), "reason": info.get("reason", "")})
+            return result
+
     def is_key_disabled(self, item: str) -> bool:
         """检查某个 key 是否被禁用
         
@@ -591,6 +800,7 @@ class ThreadSafeCircularList:
             model_key = "default"
 
         rate_limit = None
+        matched_default = False
         # 先尝试精确匹配
         if model and model in self.rate_limits:
             rate_limit = self.rate_limits[model]
@@ -603,12 +813,20 @@ class ThreadSafeCircularList:
 
         # 如果都没匹配到，使用默认值
         if rate_limit is None:
-            rate_limit = self.rate_limits.get("default", [(999999, 60)])  # 默认限制
+            rate_limit = self.rate_limits.get("default", [(999999, 60)])  #默认限制
+            matched_default = True
 
         # 检查所有速率限制条件
         for limit_count, limit_period in rate_limit:
-            # 使用特定模型的请求记录进行计算
-            recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
+            if matched_default:
+                # default 规则：跨所有模型汇总计数，作为该 key 的总量限制
+                recent_requests = sum(
+                    1 for mk_reqs in self.requests[item].values()
+                    for req in mk_reqs if req > now - limit_period
+                )
+            else:
+                # 模型特定规则：仅计算该模型的请求数
+                recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
             if recent_requests >= limit_count:
                 if not is_check:
                     logger.warning(f"API key {item}: model: {model_key} has been rate limited ({limit_count}/{limit_period} seconds)")
@@ -623,6 +841,7 @@ class ThreadSafeCircularList:
             self.requests[item][model_key].append(now)
 
         return False
+
 
     async def next(self, model: str = None):
         async with self.lock:
@@ -700,12 +919,19 @@ class ThreadSafeCircularList:
             return True
     
     def get_enabled_items_count(self) -> int:
-        """返回启用的项目数量
-        
+        """返回启用的项目数量。
+
+        排除配置禁用和运行时自动禁用（未过期）的 Key。
+        对 auto_disabled_info 中已过期的记录不计入禁用。
+
         Returns:
             int: 启用的 items 数量
         """
-        return len([item for item in self.items if not self.is_key_disabled(item)])
+        now = time()
+        return len([item for item in self.items
+                    if not self.is_key_disabled(item) and not (
+                        item in self.auto_disabled_info and now < self.cooling_until.get(item, 0)
+                    )])
 
     async def after_next_current(self):
         # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个
@@ -797,7 +1023,9 @@ async def generate_sse_response(
     completion_tokens=0,
     reasoning_content=None,
     stop=None,
-    thought_signature=None
+    thought_signature=None,
+    cached_tokens=0,
+    cache_creation_tokens=0
 ):
     """
     生成 OpenAI Chat Completions 格式的 SSE 响应
@@ -816,6 +1044,8 @@ async def generate_sse_response(
         reasoning_content: 推理内容
         stop: 停止原因（如 "stop", "tool_calls"）
         thought_signature: Gemini 思考签名
+        cached_tokens: 上游缓存命中 token 数，用于输出 prompt_tokens_details.cached_tokens
+        cache_creation_tokens: 上游缓存创建 token 数，作为内核补充字段供 Claude 方言还原
     """
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -859,8 +1089,8 @@ async def generate_sse_response(
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
-    # 优先级 7：普通文本内容
-    elif content:
+    # 优先级 7：普通文本内容（支持 string 或结构化 list）
+    elif content is not None and content != "":
         delta_content = {"role": "assistant", "content": content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
@@ -888,19 +1118,23 @@ async def generate_sse_response(
     
     # usage chunk 特殊处理：清空 choices，设置 usage
     if total_tokens:
-        sample_data["usage"] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
-        }
+        # usage chunk 是内核到下游的统一出口；这里集中补充缓存字段，避免各通道重复拼装且出现遗漏。
+        sample_data["usage"] = build_openai_usage(
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         sample_data["choices"] = []
 
-    json_data = await asyncio.to_thread(json.dumps, sample_data, ensure_ascii=False)
+    json_data = json_dumps_text(sample_data, ensure_ascii=False)
     sse_response = f"data: {json_data}" + end_of_line
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False):
+
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     message = {
@@ -935,7 +1169,7 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         if not tools_id:
             tools_id = f"call_{random_str}"
 
-        arguments_json = await asyncio.to_thread(json.dumps, function_call_content, ensure_ascii=False)
+        arguments_json = json_dumps_text(function_call_content, ensure_ascii=False)
 
         sample_data = {
             "id": f"chatcmpl-{random_str}",
@@ -982,17 +1216,28 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         total_tokens = None
 
     if total_tokens:
-        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+        # 非流式响应与 SSE usage chunk 使用同一构造函数，目的在于让缓存字段在两种输出模式中保持一致。
+        sample_data["usage"] = build_openai_usage(
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
 
-    json_data = await asyncio.to_thread(json.dumps, sample_data, ensure_ascii=False)
+    if return_dict:
+        return sample_data
+
+    json_data = json_dumps_text(sample_data, ensure_ascii=False)
     # print("json_data", json.dumps(sample_data, indent=4, ensure_ascii=False))
 
     return json_data
 
 def get_image_format(file_content: bytes):
     try:
-        img = Image.open(io.BytesIO(file_content))
-        return img.format.lower()
+        with Image.open(io.BytesIO(file_content)) as img:
+            img_format = (img.format or "").lower()
+        return img_format or None
     except Exception:
         return None
 
@@ -1010,31 +1255,59 @@ def encode_image(file_content: bytes):
         raise ValueError(f"不支持的图片格式: {img_format}")
 
 async def get_image_from_url(url):
-    transport = httpx.AsyncHTTPTransport(
-        http2=True,
-        verify=False,
-        retries=1
-    )
-    async with httpx.AsyncClient(transport=transport) as client:
-        try:
-            response = await client.get(
-                url,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            return response.content
-
-        except httpx.RequestError as e:
-            logger.error(f"请求 URL 时出错 {e.request.url!r}: {e}")
-            raise HTTPException(status_code=400, detail=f"无法从 URL 获取内容: {url}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"获取 URL 时发生 HTTP 错误 {e.request.url!r}: {e.response.status_code}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"获取 URL 时出错: {url}")
+    try:
+        content, _ = await fetch_url_content(url)
+        return content
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取 URL 时发生错误: {url}: {e}")
+        raise HTTPException(status_code=400, detail=f"无法从 URL 获取内容: {url}")
 
 async def get_encode_image(image_url):
     file_content = await get_image_from_url(image_url)
-    base64_image = encode_image(file_content)
+    base64_image = await asyncio.to_thread(encode_image, file_content)
     return base64_image
+
+
+def _convert_webp_base64_to_png(base64_image: str) -> tuple[str, str]:
+    image_data = base64.b64decode(extract_base64_data(base64_image))
+    with Image.open(io.BytesIO(image_data)) as image:
+        png_buffer = io.BytesIO()
+        image.save(png_buffer, format="PNG")
+    png_base64 = base64.b64encode(png_buffer.getvalue()).decode('utf-8')
+    return f"data:image/png;base64,{png_base64}", "image/png"
+
+
+def _prepare_image_for_upload(base64_image: str, max_size_mb: float) -> dict:
+    base64_data = extract_base64_data(base64_image)
+    image_size_bytes = len(base64_data) * 3 // 4
+    image_size_mb = image_size_bytes / (1024 * 1024)
+    result = {
+        "base64_data": base64_data,
+        "original_size_mb": image_size_mb,
+        "compressed": False,
+        "compressed_size_mb": image_size_mb,
+        "size": None,
+    }
+
+    if image_size_mb <= max_size_mb:
+        return result
+
+    image_bytes = base64.b64decode(base64_data)
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        scale = (max_size_mb / image_size_mb) ** 0.5
+        new_width = max(1, int(img.width * scale))
+        new_height = max(1, int(img.height * scale))
+        resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        if resized.mode in ('RGBA', 'LA', 'P'):
+            resized = resized.convert('RGB')
+        resized.save(output, format='JPEG', quality=85, optimize=True)
+    compressed_base64 = base64.b64encode(output.getvalue()).decode('utf-8')
+    compressed_size_mb = len(compressed_base64) * 3 // 4 / (1024 * 1024)
+    result.update({"base64_data": compressed_base64, "compressed": True, "compressed_size_mb": compressed_size_mb, "size": (new_width, new_height)})
+    return result
 
 # from PIL import Image
 # import io
@@ -1067,24 +1340,15 @@ async def get_base64_image(image_url: str) -> tuple[str, str]:
         tuple: (base64_image_with_prefix, mime_type)
                例如: ("data:image/png;base64,xxx", "image/png")
     """
-    if image_url.startswith("http"):
-        base64_image = await get_encode_image(image_url)
-    else:
-        base64_image = image_url
-        
-    colon_index = base64_image.index(":")
-    semicolon_index = base64_image.index(";")
-    image_type = base64_image[colon_index + 1:semicolon_index]
+    from .file_utils import get_base64_file
+    base64_image, image_type = await get_base64_file(image_url)
+
+    if not image_type.startswith("image/"):
+        raise ValueError(f"Expected an image MIME type, but got: {image_type}")
 
     # 将 webp 转换为 png（某些 API 不支持 webp）
     if image_type == "image/webp":
-        image_data = base64.b64decode(base64_image.split(",")[1])
-        image = Image.open(io.BytesIO(image_data))
-        png_buffer = io.BytesIO()
-        image.save(png_buffer, format="PNG")
-        png_base64 = base64.b64encode(png_buffer.getvalue()).decode('utf-8')
-        base64_image = f"data:image/png;base64,{png_base64}"
-        image_type = "image/png"
+        base64_image, image_type = await asyncio.to_thread(_convert_webp_base64_to_png, base64_image)
 
     return base64_image, image_type
 
@@ -1114,98 +1378,20 @@ def parse_json_safely(json_str):
 
 async def upload_image_to_0x0st(base64_image: str, max_size_mb: float = 10.0):
     """
-    Uploads a base64 encoded image to freeimage.host.
-    
-    Uses freeimage.host public guest API (no API key registration required).
-    API docs: https://freeimage.host/page/api
+    图床上传链路已暂时关闭。
 
-    Args:
-        base64_image: The base64 encoded image string.
-        max_size_mb: Maximum image size in MB. Larger images will be compressed.
-
-    Returns:
-        The URL of the uploaded image, or None if upload fails.
+    当前统一返回 None，让上层稳定走 inline base64 回退路径。
+    保留此函数签名，便于后续按需恢复或切换其他上传方案。
     """
-    # 提取纯 base64 数据（去除 data URI 前缀，如 "data:image/png;base64,"）
-    if "," in base64_image:
-        base64_data = base64_image.split(",")[1]
-    else:
-        base64_data = base64_image
-
-    # 检查图片大小
-    image_size_bytes = len(base64_data) * 3 // 4  # base64 编码后大约增加 33%
-    image_size_mb = image_size_bytes / (1024 * 1024)
-    
-    logger.info(f"[upload_image] Original size: {image_size_mb:.2f} MB")
-    
-    # 如果图片太大，尝试压缩
-    if image_size_mb > max_size_mb:
-        try:
-            logger.info(f"[upload_image] Image too large ({image_size_mb:.2f} MB), compressing...")
-            image_bytes = base64.b64decode(base64_data)
-            img = Image.open(io.BytesIO(image_bytes))
-            
-            # 计算缩放比例
-            scale = (max_size_mb / image_size_mb) ** 0.5
-            new_width = int(img.width * scale)
-            new_height = int(img.height * scale)
-            
-            # 缩放图片
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # 转换为 JPEG 格式以减小体积
-            output = io.BytesIO()
-            if img.mode in ('RGBA', 'LA', 'P'):
-                # 有透明通道的转为 RGB
-                img = img.convert('RGB')
-            img.save(output, format='JPEG', quality=85, optimize=True)
-            base64_data = base64.b64encode(output.getvalue()).decode('utf-8')
-            
-            new_size_mb = len(base64_data) * 3 // 4 / (1024 * 1024)
-            logger.info(f"[upload_image] Compressed to {new_size_mb:.2f} MB, new size: {new_width}x{new_height}")
-        except Exception as e:
-            logger.error(f"[upload_image] Compression failed: {e}")
-            # 压缩失败，继续尝试上传原图
-
-    # freeimage.host 公共 guest API key
-    FREEIMAGE_API_KEY = "6d207e02198a847aa98d0a2a901485a5"
-    
-    # 增加超时时间，大文件需要更长时间
-    timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
-    
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            # freeimage.host API: POST https://freeimage.host/api/1/upload
-            # 参数: key (API key), source (base64 或文件), format (json/redirect/txt)
-            logger.info(f"[upload_image] Uploading to freeimage.host...")
-            response = await client.post(
-                "https://freeimage.host/api/1/upload",
-                data={
-                    'key': FREEIMAGE_API_KEY,
-                    'source': base64_data,
-                    'format': 'json',
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-            if result.get('success') or result.get('status_code') == 200:
-                # 返回直接图片链接
-                url = result.get('image', {}).get('url')
-                if url:
-                    logger.info(f"[upload_image] Upload successful: {url}")
-                    return url
-            logger.error(f"[upload_image] freeimage.host 上传失败: {result}")
-        except httpx.TimeoutException as e:
-            logger.error(f"[upload_image] 上传超时: {e}")
-        except httpx.RequestError as e:
-            logger.error(f"[upload_image] 请求 freeimage.host 时出错: {e}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"[upload_image] 上传图片到 freeimage.host 时发生 HTTP 错误: {e.response.status_code}, {e.response.text[:500]}")
-        except Exception as e:
-            logger.error(f"[upload_image] freeimage.host 上传异常: {e}")
-    
-    # 上传失败，返回 None（而不是原始 base64，避免返回超大响应）
+    _ = base64_image
+    _ = max_size_mb
+    logger.info("[upload_image] External image upload is disabled. Use inline base64 instead.")
     return None
+
+
+
+
+
 
 if __name__ == "__main__":
     provider = {
@@ -1213,3 +1399,4 @@ if __name__ == "__main__":
         "engine": "vertex",
     }
     print(get_engine(provider))
+

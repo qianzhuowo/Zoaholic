@@ -1,13 +1,11 @@
-# syntax=docker/dockerfile:1.7
 # ===============
 # Stage 1: Frontend build
 # ===============
-FROM node:20.19.0-bookworm-slim AS frontend_builder
+FROM node:20-slim AS frontend_builder
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --no-audit --prefer-offline
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
@@ -17,8 +15,6 @@ RUN npm run build
 FROM python:3.11 AS builder
 WORKDIR /app
 
-ENV UV_CACHE_DIR=/root/.cache/uv
-
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
 # 使用 uv export 导出依赖列表，然后安装到系统 Python
@@ -27,9 +23,8 @@ COPY pyproject.toml uv.lock ./
 # 这里用 --no-emit-project 仅导出第三方依赖，避免在 CI/Docker 构建时报：
 #  - File '/app/README.md' cannot be found
 #  - package directory 'core' does not exist
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt && \
-    uv pip install --system -r requirements.txt
+RUN uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt && \
+    uv pip install --system --no-cache -r requirements.txt
 
 # ===============
 # Stage 3: Runtime
@@ -43,8 +38,7 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY . .
 
 # 将前端产物放入后端 static/ 目录（FastAPI 直接挂载）
-# frontend_builder 的工作目录是 /app/frontend，因此构建产物在 /app/static
 COPY --from=frontend_builder /app/static ./static
 
-# Render 会注入 $PORT；用 shell 形式让变量生效
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# 部分云平台会注入 $PORT；用 shell 形式让变量生效
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]

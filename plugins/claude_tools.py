@@ -25,10 +25,6 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 from core.log_config import logger
-from core.utils import (
-    build_claude_thinking_payload,
-    apply_claude_thinking_constraints,
-)
 from core.plugins import (
     register_request_interceptor,
     unregister_request_interceptor,
@@ -39,12 +35,13 @@ from core.plugins import (
 PLUGIN_INFO = {
     "name": "claude_tools",
     "version": "1.0.0",
-    "description": "Claude 工具插件 - 支持 -thinking/-search/-code 等后缀的原生 Claude 渠道参数设置",
+    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-search。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["claude", "anthropic", "thinking", "tools"],
+        "params_hint": "无需参数。后缀直接写在模型名后: -thinking[-N] / -search / -code / -computer / -artifacts",
     },
 }
 
@@ -153,11 +150,15 @@ def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int) -> None:
         payload: 请求 payload
         budget_tokens: thinking budget tokens
     """
-    payload["thinking"] = build_claude_thinking_payload(
-        budget_tokens=budget_tokens, thinking_type="enabled")
+    payload["thinking"] = {
+        "type": "enabled",
+        "budget_tokens": budget_tokens
+    }
 
     # thinking 模式要求 temperature=1，且不能有 top_p/top_k
-    apply_claude_thinking_constraints(payload)
+    payload["temperature"] = 1
+    payload.pop("top_p", None)
+    payload.pop("top_k", None)
 
     logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 

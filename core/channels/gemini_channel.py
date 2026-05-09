@@ -18,11 +18,26 @@ from ..utils import (
     generate_sse_response,
     generate_no_stream_response,
     end_of_line,
+    generate_chunked_image_md,
     upload_image_to_0x0st,
 )
 from ..response import check_response
-from ..file_utils import normalize_file_ref, require_resolved_file_data, raise_fileref_unsupported_error
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
 from urllib.parse import urlparse
+
+
+# ============================================================
+# Gemini 工具函数
+# ============================================================
+
+def _is_image_model(model_name: str) -> bool:
+    """判断模型是否为图片生成模型（基于模型名约定）"""
+    name = model_name.lower()
+    return "-image" in name or "image-generation" in name
 
 
 # ============================================================
@@ -40,26 +55,7 @@ async def format_image_message(image_url: str) -> dict:
     return {
         "inlineData": {
             "mimeType": image_type,
-            "data": base64_image.split(",")[1],
-        }
-    }
-
-
-async def format_file_message(file_ref) -> dict:
-    """格式化 FileRef 为 Gemini inlineData。"""
-    normalized = await normalize_file_ref(file_ref)
-    if normalized.file_id:
-        raise_fileref_unsupported_error("Gemini", normalized.mime_type, "图片、PDF、文本附件（需提供 file.url/file.data）")
-
-    mime_type, base64_data = require_resolved_file_data(
-        normalized,
-        "Gemini",
-        "图片、PDF、文本附件（需提供 file.url/file.data）",
-    )
-    return {
-        "inlineData": {
-            "mimeType": mime_type,
-            "data": base64_data,
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -154,13 +150,18 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         sse_param = ""
     url = provider['base_url']
     parsed_url = urlparse(url)
+
+    # 如果 base_url 以 '#' 结尾，直接使用去掉 '#' 后的地址，跳过路径拼接
+    if provider['base_url'].endswith('#'):
+        url = provider['base_url'][:-1].rstrip('/')
+    else:
+        # 正常路径拼接
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.split('/models')[0].rstrip('/')}/models/{original_model}:{gemini_stream}{sse_param}"
+
     if "/v1beta" in parsed_url.path:
         api_version = "v1beta"
     else:
         api_version = "v1"
-
-    # 不再在 URL 中放置 key，改用请求头认证
-    url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.split('/models')[0].rstrip('/')}/models/{original_model}:{gemini_stream}{sse_param}"
 
     messages = []
     systemInstruction = None
@@ -191,9 +192,34 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                     parts.append(format_text_message(item.text))
                 elif item.type == "image_url" and provider.get("image", True):
                     parts.append(await format_image_message(item.image_url.url))
-                elif item.type == "file" and getattr(item, "file", None):
-                    parts.append(await format_file_message(item.file))
-
+                elif item.type == "file":
+                    if getattr(item.file, "file_uri", None):
+                        parts.append({
+                            "fileData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "fileUri": item.file.file_uri
+                            }
+                        })
+                    elif getattr(item.file, "url", None):
+                        from ..file_utils import get_base64_file, parse_data_uri
+                        data_uri, mime_type = await get_base64_file(item.file.url)
+                        if data_uri.startswith("data:"):
+                            _, b64_data = parse_data_uri(data_uri)
+                        else:
+                            b64_data = data_uri
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": b64_data
+                            }
+                        })
+                    elif getattr(item.file, "data", None):
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "data": item.file.data
+                            }
+                        })
         elif msg.content:
             parts.append({"text": msg.content})
 
@@ -202,9 +228,11 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             for i, tc in enumerate(msg.tool_calls):
                 # 转换 arguments
                 try:
-                    args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                    args = json_loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
                 except:
                     args = {}
+
+
                 
                 part = {
                     "functionCall": {
@@ -251,7 +279,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     if system_prompt.strip():
         systemInstruction = {"parts": [{"text": system_prompt}]}
 
-    if any(off_model in original_model for off_model in gemini_max_token_65k_models) or original_model.endswith("-image-generation"):
+    if any(off_model in original_model for off_model in gemini_max_token_65k_models) or _is_image_model(original_model):
         safety_settings = "OFF"
     else:
         safety_settings = "BLOCK_NONE"
@@ -396,7 +424,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            if field == "tools" and ("gemini-2.0-flash-thinking" in original_model or "gemini-2.5-flash-image" in original_model or "gemini-3-pro-image" in original_model):
+            if field == "tools" and ("gemini-2.0-flash-thinking" in original_model or _is_image_model(original_model)):
                 continue
             if field == "tools":
                 # 处理每个工具的 function 定义
@@ -440,9 +468,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                         "tool_config": tool_config
                     })
             elif field == "temperature":
-                if "gemini-2.5-flash-image" in original_model:
-                    value = 1
-                if "gemini-3-pro-image" in original_model:
+                if _is_image_model(original_model):
                     value = 1
                 generation_config["temperature"] = value
             elif field == "max_tokens" or field == "max_completion_tokens":
@@ -469,7 +495,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     if "maxOutputTokens" not in generation_config:
         payload["generationConfig"]["maxOutputTokens"] = 32768
 
-        if ("-image" in original_model):
+        if _is_image_model(original_model):
             payload["generationConfig"]["responseModalities"] = [
                 "Text",
                 "Image",
@@ -510,7 +536,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             # 合并到 generationConfig 中（extra_body.google.thinking_config -> generationConfig.thinkingConfig）
             _deep_merge(payload["generationConfig"], converted_config)
 
-    if "gemini-2.5" in original_model and "gemini-2.5-flash-image" not in original_model:
+    if "gemini-2.5" in original_model and not _is_image_model(original_model):
         # 从请求模型名中检测思考预算设置
         m = re.match(r".*-think-(-?\d+)", request.model)
         if m:
@@ -686,7 +712,7 @@ def gemini_json_process(response_json):
 async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     """处理 Gemini 非流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_gemini_response")
@@ -695,7 +721,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
 
     if isinstance(response_json, str):
         import ast
@@ -729,13 +755,23 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=candidatesTokenCount)
         total_tokens = safe_get(usage_metadata, "totalTokenCount", default=totalTokenCount)
 
+        mark_adapter_metrics_managed()
+        # Gemini 的 cachedContentTokenCount 与普通 token 同在 usageMetadata，需要同步写入日志统计和下游响应。
+        cache_usage = extract_cache_usage(usage_metadata)
+        merge_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=candidates_tokens,
+            total_tokens=total_tokens,
+            **cache_usage,
+        )
+
         # 检查是否返回了有效内容
         has_content = content and content.strip()
         has_reasoning = reasoning_content and reasoning_content.strip()
         has_function_call = function_call_name is not None
         has_image = image_base64 is not None
         
-        is_image_model = "-image" in model.lower() or "image-generation" in model.lower()
+        is_image_model = _is_image_model(model)
         
         # 图像模型必须有图片
         if is_image_model and not has_image:
@@ -762,36 +798,42 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             role = "assistant"
 
         # 检查是否需要处理图像
-        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片（比如普通大模型使用 Python 代码执行工具画了图表），
-        # 我们都统一将其转换为 Markdown 图片追加到文本内容中，确保在标准聊天客户端中可见，
-        # 并防止被 utils.py 错误地转换为只包含 b64_json 的图片生成 API 格式。
+        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片，
+        # 都将其转换为结构化 content list，让方言出口层决定最终格式。
         if image_base64:
             try:
                 from ..log_config import logger
                 logger.info(f"[Gemini] Processing image for non-stream response, model={model}")
                 
-                # 发送 SSE 注释作为 keepalive 并不适用这里，因为是非流式
-                # 上传到图床
-                image_url = await upload_image_to_0x0st("data:image/png;base64," + image_base64, max_size_mb=50.0)
-                
-                if image_url and image_url.startswith("http"):
-                    content = (content or "") + f"\n\n![image]({image_url})"
-                    image_base64 = None # 清除，防止 generate_no_stream_response 返回图像 API 格式
-                else:
-                    # 上传失败，返回 data URI 格式的 base64
-                    content = (content or "") + f"\n\n![image](data:image/png;base64,{image_base64})"
-                    image_base64 = None
+                # 构建结构化 content list
+                content_items = []
+                if content:
+                    content_items.append({"type": "text", "text": content})
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                })
+                content = content_items
+                image_base64 = None  # 清除，防止 generate_no_stream_response 返回图像 API 格式
+
             except Exception as e:
                 from ..log_config import logger
                 logger.error(f"[Gemini] Error processing image in non-stream: {e}")
                 # 出错时保持原样，由 generate_no_stream_response 处理
+
+        if has_content or has_reasoning or has_image or has_function_call:
+            mark_content_start()
 
         yield await generate_no_stream_response(
             timestamp, model, content=content, tools_id=None, 
             function_call_name=function_call_name, function_call_content=function_full_response, 
             role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
             completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
-            image_base64=image_base64, thought_signature=thought_signature
+            image_base64=image_base64, thought_signature=thought_signature,
+            # 非流式 Gemini 输出需要继续携带缓存命中字段，供 OAI 与下游方言转换使用。
+            cached_tokens=cache_usage["cached_tokens"],
+            cache_creation_tokens=cache_usage["cache_creation_tokens"],
+            return_dict=True
         )
         return
 
@@ -799,16 +841,18 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
     """处理 Gemini 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
             yield _normalize_gemini_http_error(error_message)
             return
-        buffer = ""
+        mark_adapter_metrics_managed()
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # 流式 Gemini 的缓存命中数量跟随 usageMetadata 出现，跨 chunk 保留后写入 current_info。
+        cachedContentTokenCount = 0
         parts_json = ""
         
         # 用于追踪整个流中是否有有效内容
@@ -817,37 +861,35 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         has_function_call = False  # 是否有函数调用
         has_reasoning = False  # 是否有思维链
         stream_finished_normally = False  # 是否正常结束
-        
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            if buffer and "\n" not in buffer:
-                buffer += "\n"
 
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if line.startswith("data: "):
-                    parts_json = line.lstrip("data: ").strip()
-                    try:
-                        response_json = await asyncio.to_thread(json.loads, parts_json)
-                    except json.JSONDecodeError:
-                        continue
-                else:
-                    parts_json += line
-                    parts_json = parts_json.lstrip("[,")
-                    try:
-                        response_json = await asyncio.to_thread(json.loads, parts_json)
-                    except json.JSONDecodeError:
-                        continue
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
+            if not line:
+                continue
 
-                # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
-                is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(response_json)
+            if line.startswith("data:"):
+                parts_json = line[5:].strip()
+                try:
+                    response_json = json_loads(parts_json)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                parts_json += line
+                parts_json = parts_json.lstrip("[,")
+                try:
+                    response_json = json_loads(parts_json)
+                except json.JSONDecodeError:
+                    continue
+
+            # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
+            is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(response_json)
                 
-                # 调试日志：记录每个 chunk 的关键信息
-                from ..log_config import logger
-                if image_base64:
-                    logger.info(f"[Gemini] image_base64 received, length={len(image_base64)}, finishReason={finishReason}")
-                if finishReason:
-                    logger.info(f"[Gemini] finishReason={finishReason}, has_image={bool(image_base64)}, content_len={len(content) if content else 0}")
+            # 调试日志：记录每个 chunk 的关键信息
+            from ..log_config import logger
+            if image_base64:
+                    # 注意：避免在此处直接打印或使用 image_base64，它可能是一个极大的字符串
+                logger.debug(f"[Gemini] image_base64 received, length={len(image_base64)}, finish={finishReason}")
+            if finishReason:
+                logger.debug(f"[Gemini] finishReason={finishReason}, has_image={bool(image_base64)}, len={len(content) if content else 0}")
 
                 # 追踪有效内容
                 if is_thinking and reasoning_content:
@@ -859,74 +901,87 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                 if function_call_name:
                     has_function_call = True
 
-                if is_thinking:
-                    sse_string = await generate_sse_response(timestamp, model, reasoning_content=reasoning_content, thought_signature=thought_signature)
+            if totalTokenCount > 0 or promptTokenCount > 0 or candidatesTokenCount > 0:
+                _cache_usage = extract_cache_usage(safe_get(response_json, "usageMetadata", default={}) or {})
+                if _cache_usage["cached_tokens"]:
+                    cachedContentTokenCount = _cache_usage["cached_tokens"]
+                merge_usage(
+                    prompt_tokens=promptTokenCount,
+                    completion_tokens=candidatesTokenCount,
+                    total_tokens=totalTokenCount,
+                    cached_tokens=cachedContentTokenCount,
+                    cache_creation_tokens=_cache_usage["cache_creation_tokens"],
+                )
+
+            if is_thinking:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, reasoning_content=reasoning_content, thought_signature=thought_signature)
+                yield sse_string
+            if not image_base64 and content:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, content=content, thought_signature=thought_signature)
+                yield sse_string
+
+            if image_base64:
+                if not _is_image_model(model):
+                    pass # Ignored base64 from non-image model in streaming mode, usually duplicate or not supported by standard SSE
+                else:
+                    image_size_mb = len(image_base64) * 3 / 4 / (1024 * 1024)
+                    logger.debug(f"[Gemini] Processing image, size={image_size_mb:.2f} MB")
+                    # 发送 SSE 注释作为 keepalive，防止客户端超时断开
+                    # 这里不再走图床，统一直接以内联 base64 返回
+                    mark_content_start()
+                    yield ": streaming inline image\n\n"
+
+                    logger.debug("[Gemini] Returning inline base64 image via structured content item")
+                    # 直接发结构化 image content item，方言出口各自转换
+                    image_content_item = [{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                    }]
+                    sse_string = await generate_sse_response(
+                        timestamp, model, content=image_content_item,
+                        thought_signature=thought_signature
+                    )
                     yield sse_string
-                if not image_base64 and content:
-                    sse_string = await generate_sse_response(timestamp, model, content=content, thought_signature=thought_signature)
+
+
+
+            if function_call_name:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=function_call_name, thought_signature=thought_signature)
+                yield sse_string
+            if function_full_response:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response, thought_signature=thought_signature)
+                yield sse_string
+
+
+            if parts_json == "[]" or (blockReason and blockReason != "STOP"):
+                msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
+                yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": msg}
+                return
+            elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
+                # 非正常结束原因（如 SAFETY, RECITATION 等）
+                yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": f"{finishReason}"}
+                return
+            elif finishReason:
+                # 正常结束（STOP 或 MAX_TOKENS）
+                # 注意：部分上游/模型可能会直接返回 finishReason=STOP 但不包含任何内容。
+                # 若在本次流中没有任何有效内容，则不要先发 stop chunk（否则可能被上层判为“空响应”）。
+                stream_finished_normally = True
+
+                if has_content or has_reasoning or has_function_call or has_image:
+                    sse_string = await generate_sse_response(timestamp, model, stop="stop")
                     yield sse_string
 
-                if image_base64:
-                    if "-image" not in model.lower() and "image-generation" not in model.lower():
-                        pass # Ignored base64 from non-image model in streaming mode, usually duplicate or not supported by standard SSE
-                    else:
-                        image_size_mb = len(image_base64) * 3 / 4 / (1024 * 1024)
-                        logger.info(f"[Gemini] Processing image, size={image_size_mb:.2f} MB")
-                        
-                        # 发送 SSE 注释作为 keepalive，防止客户端超时断开
-                        # SSE 规范：以冒号开头的行是注释，客户端会忽略但能保持连接
-                        yield ": uploading image\n\n"
-                            
-                        # 上传到图床（不压缩，保持原图质量）
-                        image_url = await upload_image_to_0x0st("data:image/png;base64," + image_base64, max_size_mb=50.0)
-                        
-                        # 检查上传是否成功
-                        if image_url and image_url.startswith("http"):
-                            logger.info(f"[Gemini] Image uploaded successfully: {image_url}")
-                            sse_string = await generate_sse_response(timestamp, model, content=f"\n\n![image]({image_url})", thought_signature=thought_signature)
-                            yield sse_string
-                        else:
-                            # 上传失败，返回 data URI 格式的 base64（直接嵌入）
-                            logger.warning(f"[Gemini] Image upload failed, returning inline base64 data URI")
-                            sse_string = await generate_sse_response(
-                                timestamp, model, 
-                                content=f"\n\n![image](data:image/png;base64,{image_base64})", 
-                                thought_signature=thought_signature
-                            )
-                            yield sse_string
+                break
 
-                if function_call_name:
-                    sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=function_call_name, thought_signature=thought_signature)
-                    yield sse_string
-                if function_full_response:
-                    sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response, thought_signature=thought_signature)
-                    yield sse_string
-
-                if parts_json == "[]" or (blockReason and blockReason != "STOP"):
-                    msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
-                    yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": msg}
-                    return
-                elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
-                    # 非正常结束原因（如 SAFETY, RECITATION 等）
-                    yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": f"{finishReason}"}
-                    return
-                elif finishReason:
-                    # 正常结束（STOP 或 MAX_TOKENS）
-                    # 注意：部分上游/模型可能会直接返回 finishReason=STOP 但不包含任何内容。
-                    # 若在本次流中没有任何有效内容，则不要先发 stop chunk（否则可能被上层判为“空响应”）。
-                    stream_finished_normally = True
-
-                    if has_content or has_reasoning or has_function_call or has_image:
-                        sse_string = await generate_sse_response(timestamp, model, stop="stop")
-                        yield sse_string
-
-                    break
-
-                parts_json = ""
+            parts_json = ""
 
         # 检查图像生成模型是否实际返回了图片
         # 对于 image 模型，如果只有思维链但没有图片，视为生成失败
-        is_image_model = "-image" in model.lower() or "image-generation" in model.lower()
+        is_image_model = _is_image_model(model)
         
         if is_image_model and not has_image:
             # 图像生成模型但没有生成图片
@@ -965,7 +1020,13 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         
         # 发送 usage chunk（如果有）
         if totalTokenCount > 0:
-            sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+            sse_string = await generate_sse_response(
+                timestamp, model, None, None, None, None, None,
+                totalTokenCount, promptTokenCount, candidatesTokenCount,
+                # 流式 Gemini 最终 usage chunk 需要带回跨 chunk 保存的 cachedContentTokenCount。
+                cached_tokens=cachedContentTokenCount,
+                cache_creation_tokens=0,
+            )
             yield sse_string
 
     yield "data: [DONE]" + end_of_line
@@ -978,12 +1039,13 @@ async def fetch_gemini_models(client, provider):
     """
     from ..log_config import logger
 
-    base_url = provider.get('base_url', 'https://generativelanguage.googleapis.com/v1beta').rstrip('/')
+    raw_base_url = provider.get('base_url', 'https://generativelanguage.googleapis.com/v1beta')
     api_key = provider.get('api')
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
 
-    url = f"{base_url}/models"
+    from ..utils import resolve_base_url
+    url = resolve_base_url(raw_base_url, '/models')
 
     headers = {
         'Content-Type': 'application/json',

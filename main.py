@@ -14,10 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, Request
 
-from core.log_config import logger, apply_backend_log_preferences
+from core.log_config import logger
 from routes import api_router
 from core.env import env_bool
+from core.log_config import apply_backend_log_preferences
+from core.watchdog import EventLoopBlockWatchdog as LightWatchdog
 from core.utils import parse_rate_limit, ThreadSafeCircularList, ApiKeyRateLimitRegistry
+from core.utils import is_local_api_key
+from core.block_watchdog import EventLoopBlockWatchdog
 from core.client_manager import ClientManager
 from core.channel_manager import ChannelManager
 from core.routing import set_debug_mode as set_routing_debug_mode
@@ -26,10 +30,9 @@ from core.handler import (
     set_debug_mode as set_handler_debug_mode,
 )
 from core.middleware import StatsMiddleware, request_info, get_api_key
-from core.error_response import openai_error_response, normalize_error_detail, create_proxy_error_response, normalize_proxy_error_policy
-from core.watchdog import EventLoopBlockWatchdog
+from core.error_response import openai_error_response
 
-from utils import safe_get, load_config, is_local_api_key
+from utils import safe_get, load_config
 
 from db import DISABLE_DATABASE, RequestStat, AdminUser, DB_TYPE, async_session_scope
 from core.stats import (
@@ -39,7 +42,7 @@ from core.stats import (
 )
 from core.plugins import get_plugin_manager
 
-DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 240))
+DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
@@ -107,10 +110,13 @@ async def cleanup_expired_raw_data():
                 if (DB_TYPE or "sqlite").lower() == "d1":
                     result = await db.execute(
                         "UPDATE request_stats "
-                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
+                        # 修改原因：新增 upstream_response_headers 后，过期原始数据清理需要同步覆盖该列。
+                        # 修改方式：在 D1 清理 SQL 的 SET 和非空判断中加入 upstream_response_headers。
+                        # 目的：避免响应头超过保留期后仍留在 request_stats。
+                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_headers = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
                         "WHERE raw_data_expires_at IS NOT NULL "
                         "AND raw_data_expires_at < ? "
-                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
                         [now],
                     )
                     rowcount = int((result.get("meta") or {}).get("changes") or 0)
@@ -129,6 +135,10 @@ async def cleanup_expired_raw_data():
                         (RequestStat.request_body.isnot(None)) |
                         (RequestStat.upstream_request_headers.isnot(None)) |
                         (RequestStat.upstream_request_body.isnot(None)) |
+                        # 修改原因：SQLAlchemy 分支的过期清理条件也必须包含新增响应头字段。
+                        # 修改方式：在非空条件中追加 RequestStat.upstream_response_headers。
+                        # 目的：只有响应头未清理的旧记录也能被匹配并清空。
+                        (RequestStat.upstream_response_headers.isnot(None)) |
                         (RequestStat.upstream_response_body.isnot(None)) |
                         (RequestStat.response_body.isnot(None)) |
                         (RequestStat.retry_path.isnot(None))
@@ -138,6 +148,10 @@ async def cleanup_expired_raw_data():
                         request_body=None,
                         upstream_request_headers=None,
                         upstream_request_body=None,
+                        # 修改原因：清理动作匹配后需要实际清空新增响应头字段。
+                        # 修改方式：在 update().values 中把 upstream_response_headers 设为 None。
+                        # 目的：保证 SQLAlchemy 数据库类型与 D1 的清理结果一致。
+                        upstream_response_headers=None,
                         upstream_response_body=None,
                         response_body=None,
                         retry_path=None,
@@ -342,19 +356,16 @@ async def lifespan(app: FastAPI):
     app.state.version = VERSION
     app.state.started_at = datetime.now(timezone.utc)
     app.state.startup_completed = False
-
-    watchdog = EventLoopBlockWatchdog.from_env()
-    app.state.event_loop_watchdog = watchdog
-    await watchdog.start()
     
     # 启动定时清理任务
     cleanup_task = None
     logs_cleanup_task = None
+    block_watchdog = None
     if not DISABLE_DATABASE:
         try:
             await create_tables()
         except Exception as e:
-            # 让 Render 等平台的日志里更直观地看到启动失败原因
+            # 让云平台的日志里更直观地看到启动失败原因
             logger.exception("Database init failed during startup: %s", e)
             raise
 
@@ -407,7 +418,7 @@ async def lifespan(app: FastAPI):
                 )
         app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
 
-        apply_backend_log_preferences(safe_get(app.state.config, "preferences", default={}) or {})
+        apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
 
         # 如果没有任何 API key，则标记需要初始化并允许服务启动（用于 /setup 初始化向导）
         if not app.state.api_keys_db or not app.state.api_list:
@@ -489,6 +500,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Failed to initialize plugin system: %s", e)
 
+    if app and not hasattr(app.state, "block_watchdog"):
+        try:
+            watchdog_settings = safe_get(app.state.config, "preferences", default={}) or {}
+            block_watchdog = EventLoopBlockWatchdog.from_settings(watchdog_settings)
+            await block_watchdog.start()
+            app.state.block_watchdog = block_watchdog
+        except Exception as e:
+            logger.error(f"Failed to start thread dump watchdog: {e}")
+
+    # 轻量事件循环监控（用于健康检查快照，与 block_watchdog 互补）
+    if app and not hasattr(app.state, "event_loop_watchdog"):
+        try:
+            light_watchdog = LightWatchdog.from_env()
+            await light_watchdog.start()
+            app.state.event_loop_watchdog = light_watchdog
+        except Exception as e:
+            logger.error(f"Failed to start event loop watchdog: {e}")
+
     # 初始化全局 model_handler
     global model_handler
     if model_handler is None:
@@ -498,6 +527,45 @@ async def lifespan(app: FastAPI):
             update_channel_stats_func=update_channel_stats,
             default_timeout=DEFAULT_TIMEOUT,
         )
+
+    # 恢复运行时自动禁用的 Key（从持久化快照）
+    try:
+        from core.utils import restore_auto_disabled
+        restore_auto_disabled()
+        logger.info("Restored auto-disabled keys from snapshot")
+    except Exception as e:
+        logger.debug(f"Failed to restore auto-disabled keys: {e}")
+
+    # 启动一次性初始化 + 统一每日维护循环
+    try:
+        from core.default_prices import fetch_prices
+        await fetch_prices()
+    except Exception as e:
+        logger.debug(f"Failed to fetch default prices: {e}")
+    try:
+        from routes.stats import warm_provider_activity
+        asyncio.get_running_loop().create_task(warm_provider_activity())
+    except Exception as e:
+        logger.debug(f"Failed to schedule provider activity warm: {e}")
+
+    async def daily_maintenance():
+        """统一每日维护：价格库刷新 + 活跃度刷新"""
+        while True:
+            await asyncio.sleep(86400)
+            try:
+                from core.default_prices import fetch_prices
+                await fetch_prices(force=True)
+                logger.info("[daily_maintenance] Prices refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Price refresh failed: {e}")
+            try:
+                from routes.stats import warm_provider_activity
+                await warm_provider_activity()
+                logger.info("[daily_maintenance] Provider activity refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Activity refresh failed: {e}")
+
+    asyncio.get_running_loop().create_task(daily_maintenance())
 
     app.state.startup_completed = True
     yield
@@ -518,12 +586,32 @@ async def lifespan(app: FastAPI):
             pass
     
     app.state.startup_completed = False
+    if hasattr(app.state, 'block_watchdog'):
+        try:
+            await app.state.block_watchdog.stop()
+        except Exception as e:
+            logger.error(f"Failed to stop thread dump watchdog: {e}")
+        finally:
+            delattr(app.state, 'block_watchdog')
+
     if hasattr(app.state, 'event_loop_watchdog'):
-        await app.state.event_loop_watchdog.stop()
+        try:
+            await app.state.event_loop_watchdog.stop()
+        except Exception as e:
+            logger.error(f"Failed to stop event loop watchdog: {e}")
+        finally:
+            delattr(app.state, 'event_loop_watchdog')
 
     # await app.state.client.aclose()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
+
+    # 关闭 file_utils 的共享 HTTP 客户端
+    try:
+        from core.file_utils import close_shared_fetch_client
+        await close_shared_fetch_client()
+    except Exception as e:
+        logger.error(f"Failed to close shared fetch client: {e}")
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
@@ -562,49 +650,20 @@ async def get_markdown_docs():
         media_type="text/markdown"
     )
 
+@app.get("/-/health")
+async def health_check():
+    """轻量级健康探针，用于进程管理器判断存活状态"""
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 # 自定义 RequestValidationError 处理已移除，如需可在单独模块中实现
-
-def _get_proxy_error_policy_from_context():
-    try:
-        current_info = request_info.get()
-    except Exception:
-        current_info = None
-    if isinstance(current_info, dict):
-        return normalize_proxy_error_policy(current_info.get("proxy_error_policy"))
-    return None
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
         token = await get_api_key(request)
         logger.error(f"404 Error: {exc.detail} api_key: {token}")
+    return openai_error_response(message=str(exc.detail), status_code=exc.status_code)
 
-    message, error_code, _param, raw_detail = normalize_error_detail(exc.detail)
-    proxy_error_policy = _get_proxy_error_policy_from_context()
-    if proxy_error_policy:
-        return create_proxy_error_response(proxy_error_policy)
-
-    return openai_error_response(
-        message=message,
-        status_code=exc.status_code,
-        code=error_code,
-        detail=raw_detail,
-    )
-
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled application error: %s", exc)
-
-    proxy_error_policy = _get_proxy_error_policy_from_context()
-    if proxy_error_policy:
-        return create_proxy_error_response(proxy_error_policy)
-
-    return openai_error_response(
-        message="Internal server error",
-        status_code=500,
-    )
 
 # 配置 CORS 中间件
 app.add_middleware(
@@ -717,6 +776,8 @@ if __name__ == '__main__':
     uvicorn_config = {
         "host": "0.0.0.0",
         "port": PORT,
+        "proxy_headers": True,
+        "forwarded_allow_ips": "*",
         "ws": "none",
         # "log_level": "warning"
     }

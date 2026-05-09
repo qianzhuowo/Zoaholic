@@ -44,7 +44,7 @@ except Exception:
     # 兼容：未安装 sqlalchemy/asyncpg 时不处理
     pass
 
-# Render / Railway 等平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
+# 云平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("DB_URL")
@@ -210,7 +210,7 @@ def _extract_mysql_ssl_connect_args(db_url: str) -> tuple[str, dict]:
 
     # TiDB Cloud Serverless 强制 TLS：若连接串未显式指定任何 SSL 参数，但目标是 tidbcloud.com，
     # 则默认启用证书校验 + 主机名校验（等价于 VERIFY_IDENTITY）。
-    # 这样可以避免在 Render 等平台上因为“insecure transport prohibited”导致启动失败。
+    # 这样可以避免在云平台上因为“insecure transport prohibited”导致启动失败。
     #
     # 注意：这里不再仅凭端口 4000 自动开启 TLS。很多自托管 TiDB/MySQL 也会使用 4000，
     # 如果一刀切强制 TLS，反而会导致本地/内网部署无法连接。
@@ -349,6 +349,14 @@ _SERVER_NOW = text("CURRENT_TIMESTAMP") if _IS_MYSQL else func.now()
 _VARCHAR = String(255) if _IS_MYSQL else String
 _VARCHAR_INDEX = String(191) if _IS_MYSQL else String
 
+# MySQL TEXT 最大 64KB，不足以存储截断至 100KB 的请求/响应体；
+# 使用 MEDIUMTEXT（16MB）避免溢出。其它数据库的 TEXT 无大小限制。
+try:
+    from sqlalchemy.dialects.mysql import MEDIUMTEXT as _MYSQL_MEDIUMTEXT
+    _BODY_TEXT = _MYSQL_MEDIUMTEXT if _IS_MYSQL else Text
+except ImportError:
+    _BODY_TEXT = Text
+
 class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
@@ -368,6 +376,9 @@ class RequestStat(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
+    # Prompt Caching 统计字段：用于保存上游返回的缓存命中和缓存创建 token，默认 0 便于旧日志按无缓存处理。
+    cached_tokens = Column(Integer, default=0, server_default="0")
+    cache_creation_tokens = Column(Integer, default=0, server_default="0")
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), server_default=_SERVER_NOW, index=True)
@@ -380,11 +391,15 @@ class RequestStat(Base):
     retry_count = Column(Integer, default=0)  # 重试次数
     retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
     request_headers = Column(Text, nullable=True)  # 用户请求头JSON格式
-    request_body = Column(Text, nullable=True)  # 用户请求体
+    request_body = Column(_BODY_TEXT, nullable=True)  # 用户请求体
     upstream_request_headers = Column(Text, nullable=True)  # 发送到上游的请求头JSON格式
-    upstream_request_body = Column(Text, nullable=True)  # 发送到上游的请求体
-    upstream_response_body = Column(Text, nullable=True)  # 上游返回的原始响应体
-    response_body = Column(Text, nullable=True)  # 返回给用户的响应体
+    upstream_request_body = Column(_BODY_TEXT, nullable=True)  # 发送到上游的请求体
+    # 修改原因：后端需要持久化上游返回的响应头，便于日志详情排查上游行为。
+    # 修改方式：新增 JSON 字符串列，与 upstream_request_headers 保持 Text 类型一致。
+    # 目的：让通用 SQLAlchemy 迁移和 RequestStat 写入都能识别 upstream_response_headers。
+    upstream_response_headers = Column(Text, nullable=True)  # 上游返回的响应头JSON格式
+    upstream_response_body = Column(_BODY_TEXT, nullable=True)  # 上游返回的原始响应体
+    response_body = Column(_BODY_TEXT, nullable=True)  # 返回给用户的响应体
     raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间
 
 class ChannelStat(Base):
@@ -511,7 +526,7 @@ if not DISABLE_DATABASE:
             DB_NAME = os.getenv("DB_NAME", "test")
             db_url = f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-        # pool_pre_ping：Render 这类平台上空闲连接容易被断开；开启可减少偶发断连
+        # pool_pre_ping：云平台上空闲连接容易被断开；开启可减少偶发断连
         db_engine = create_async_engine(
             db_url,
             echo=is_debug,

@@ -15,7 +15,6 @@ from pydantic import BaseModel, Field
 
 from core.log_config import logger
 from core.security import hash_password, verify_password
-from core.auth_errors import AUTH_LOGIN_INVALID_CREDENTIALS, auth_http_exception
 from routes.deps import get_app
 from utils import update_config, load_config_from_db
 from db import DISABLE_DATABASE, async_session_scope
@@ -133,8 +132,8 @@ async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> N
 
 
 def _generate_admin_api_key() -> str:
-    # 默认保持 sk- 前缀风格（同时兼容历史/手填 zk-）
-    return "sk-" + secrets.token_urlsafe(36)
+    # 使用 zk- 前缀
+    return "zk-" + secrets.token_urlsafe(36)
 
 
 def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
@@ -310,10 +309,10 @@ async def setup_login(payload: SetupLoginRequest = Body(...)):
         raise HTTPException(status_code=404, detail="Admin user not initialized")
 
     if admin_user.username != payload.username:
-        raise auth_http_exception(AUTH_LOGIN_INVALID_CREDENTIALS)
+        raise HTTPException(status_code=403, detail="Invalid username or password")
 
     if not verify_password(payload.password, admin_user.password_hash):
-        raise auth_http_exception(AUTH_LOGIN_INVALID_CREDENTIALS)
+        raise HTTPException(status_code=403, detail="Invalid username or password")
 
     # 从当前配置中取管理员 key（配置权威来自 api.yaml/app.state.config）
     app = get_app()

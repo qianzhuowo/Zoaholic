@@ -6,11 +6,13 @@ import Admin from './pages/Admin';
 import Settings from './pages/Settings';
 import Logs from './pages/Logs';
 import BackendLogs from './pages/BackendLogs';
+import Workspace from './pages/Workspace';
 import Plugins from './pages/Plugins';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import Setup from './pages/Setup';
 import { useAuthStore } from './store/authStore';
+import { ToastProvider } from './components/Toast';
 
 // 导入 themeStore 以确保主题初始化代码执行
 import './store/themeStore';
@@ -19,6 +21,7 @@ function App() {
   const { isAuthenticated } = useAuthStore();
 
   return (
+    <ToastProvider>
     <BrowserRouter>
       <Routes>
         <Route path="/setup" element={<Setup />} />
@@ -33,10 +36,12 @@ function App() {
           <Route path="settings" element={<Settings />} />
           <Route path="logs" element={<Logs />} />
           <Route path="backend-logs" element={<BackendLogs />} />
+          <Route path="workspace" element={<Workspace />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Route>
       </Routes>
     </BrowserRouter>
+    </ToastProvider>
   );
 }
 

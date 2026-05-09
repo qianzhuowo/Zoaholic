@@ -24,7 +24,7 @@ type MarkdownBlock =
 
 interface ListItem {
   text: string;
-  checked?: boolean; // undefined = normal item, true/false = task item
+  checked?: boolean;
 }
 
 const BLOCK_START_PATTERNS = [
@@ -95,7 +95,6 @@ const splitTableLine = (line: string) => {
   return normalized.split('|').map(cell => cell.trim());
 };
 
-// ========== KaTeX rendering ==========
 function renderKatex(latex: string, displayMode: boolean): string {
   try {
     return katex.renderToString(latex, {
@@ -126,7 +125,6 @@ function KatexSpan({ latex, displayMode, tone }: { latex: string; displayMode: b
   );
 }
 
-// ========== Footnote extraction ==========
 interface FootnoteDefinition {
   id: string;
   content: string;
@@ -150,14 +148,11 @@ function extractFootnotes(content: string): { cleanedContent: string; footnotes:
   return { cleanedContent: cleanedLines.join('\n'), footnotes };
 }
 
-// ========== Inline rendering ==========
 function renderInline(text: string, keyPrefix: string, tone: MarkdownTone): ReactNode[] {
   const tokens: ReactNode[] = [];
   const styles = TONE_STYLES[tone];
 
-  // Extended pattern: added inline math $...$ (non-greedy, not preceded/followed by $)
-  // Order: link, inline-code, inline-math, bold(**), bold(__), strikethrough, italic(*), italic(_), footnote-ref
-  const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[\^(\w+)\]/g;
+  const pattern = /!\[([^\]]*)\]\(([^\s)]+)\)|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[\^(\w+)\]/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
 
@@ -168,65 +163,69 @@ function renderInline(text: string, keyPrefix: string, tone: MarkdownTone): Reac
     }
 
     const [matched] = match;
-    if (match[1] && match[2]) {
-      // Link
+    if (match[1] !== undefined && match[2]) {
+      // Image: ![alt](url) — supports data: URIs and https://
+      tokens.push(
+        <img
+          key={`${keyPrefix}-img-${match.index}`}
+          src={match[2]}
+          alt={match[1] || 'image'}
+          className="max-w-full rounded-lg my-1 max-h-[512px] object-contain"
+          loading="lazy"
+        />
+      );
+    } else if (match[3] && match[4]) {
       tokens.push(
         <a
           key={`${keyPrefix}-link-${match.index}`}
-          href={match[2]}
+          href={match[4]}
           target="_blank"
           rel="noreferrer"
           className={`font-medium underline decoration-1 underline-offset-[3px] transition-colors break-all ${styles.link}`}
         >
-          {renderInline(match[1], `${keyPrefix}-link-text-${match.index}`, tone)}
+          {renderInline(match[3], `${keyPrefix}-link-text-${match.index}`, tone)}
         </a>
       );
-    } else if (match[3]) {
-      // Inline code
+    } else if (match[5]) {
       tokens.push(
         <code
           key={`${keyPrefix}-code-${match.index}`}
           className={styles.inlineCode}
         >
-          {match[3]}
+          {match[5]}
         </code>
       );
-    } else if (match[4]) {
-      // Inline math
+    } else if (match[6]) {
       tokens.push(
         <KatexSpan
           key={`${keyPrefix}-math-${match.index}`}
-          latex={match[4]}
+          latex={match[6]}
           displayMode={false}
           tone={tone}
         />
       );
-    } else if (match[5] || match[6]) {
-      // Bold
-      const strongText = match[5] || match[6] || '';
+    } else if (match[7] || match[8]) {
+      const strongText = match[7] || match[8] || '';
       tokens.push(
         <strong key={`${keyPrefix}-strong-${match.index}`} className="font-semibold">
           {renderInline(strongText, `${keyPrefix}-strong-text-${match.index}`, tone)}
         </strong>
       );
-    } else if (match[7]) {
-      // Strikethrough
+    } else if (match[9]) {
       tokens.push(
         <del key={`${keyPrefix}-del-${match.index}`} className="opacity-70">
-          {renderInline(match[7], `${keyPrefix}-del-text-${match.index}`, tone)}
+          {renderInline(match[9], `${keyPrefix}-del-text-${match.index}`, tone)}
         </del>
       );
-    } else if (match[8] || match[9]) {
-      // Italic
-      const emText = match[8] || match[9] || '';
+    } else if (match[10] || match[11]) {
+      const emText = match[10] || match[11] || '';
       tokens.push(
         <em key={`${keyPrefix}-em-${match.index}`} className="italic">
           {renderInline(emText, `${keyPrefix}-em-text-${match.index}`, tone)}
         </em>
       );
-    } else if (match[10]) {
-      // Footnote reference
-      const fnId = match[10];
+    } else if (match[12]) {
+      const fnId = match[12];
       tokens.push(
         <sup key={`${keyPrefix}-fnref-${match.index}`}>
           <a
@@ -275,7 +274,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Code block
     const codeStart = currentLine.match(/^```\s*([^`]*)\s*$/);
     if (codeStart) {
       const codeLines: string[] = [];
@@ -295,7 +293,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Math block ($$...$$)
     if (/^\$\$\s*$/.test(currentLine)) {
       const mathLines: string[] = [];
       index += 1;
@@ -310,7 +307,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Heading
     const heading = currentLine.match(/^(#{1,6})(?:\s+(.*))?$/);
     if (heading) {
       blocks.push({ type: 'heading', level: heading[1].length, content: (heading[2] || '').trim() });
@@ -318,14 +314,12 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // HR
     if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(currentLine)) {
       blocks.push({ type: 'hr' });
       index += 1;
       continue;
     }
 
-    // Table
     if (isTableStart(currentLine, lines[index + 1])) {
       const headers = splitTableLine(currentLine);
       const rows: string[][] = [];
@@ -338,7 +332,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Blockquote
     if (/^>\s?/.test(currentLine)) {
       const quoteLines: string[] = [];
       while (index < lines.length && /^>\s?/.test(lines[index])) {
@@ -349,7 +342,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Unordered list (including task items)
     if (/^(\s*)[-+*]\s+/.test(currentLine)) {
       const items: ListItem[] = [];
       while (index < lines.length) {
@@ -357,7 +349,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
         const itemMatch = listLine.match(/^(\s*)[-+*]\s+(.*)$/);
         if (itemMatch) {
           const itemText = itemMatch[2];
-          // Check for task list syntax
           const taskMatch = itemText.match(/^\[([ xX])\]\s*(.*)$/);
           if (taskMatch) {
             items.push({
@@ -380,7 +371,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Ordered list
     if (/^\d+\.\s+/.test(currentLine)) {
       const items: ListItem[] = [];
       while (index < lines.length) {
@@ -401,7 +391,6 @@ function parseBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    // Paragraph (fallback)
     const paragraphLines: string[] = [];
     while (index < lines.length && lines[index].trim()) {
       if (paragraphLines.length > 0 && (isBlockBoundary(lines[index]) || isTableStart(lines[index], lines[index + 1]))) {
@@ -458,7 +447,6 @@ function CodeBlock({ code, language, tone }: { code: string; language?: string; 
   );
 }
 
-// ========== Footnote section component ==========
 function FootnoteSection({ footnotes, keyPrefix, tone }: { footnotes: FootnoteDefinition[]; keyPrefix: string; tone: MarkdownTone }) {
   const styles = TONE_STYLES[tone];
   if (!footnotes.length) return null;

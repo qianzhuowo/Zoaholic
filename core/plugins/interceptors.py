@@ -44,12 +44,18 @@ register_response_interceptor("my_plugin", my_response_interceptor, priority=50)
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 import asyncio
+from contextvars import ContextVar
+from contextlib import asynccontextmanager
 import re
 
 from ..log_config import logger
 
 
 # ==================== 插件参数解析工具 ====================
+
+# 响应拦截器调用期间的 enabled_plugins 上下文
+# 由 apply_response_interceptors 在调用回调前设置，插件通过 get_current_plugin_options() 读取
+_current_enabled_plugins: ContextVar[Optional[List[str]]] = ContextVar('_current_enabled_plugins', default=None)
 
 def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
     """
@@ -173,6 +179,28 @@ def is_plugin_enabled(plugin_name: str, provider: Dict[str, Any]) -> bool:
     
     plugin_options = parse_enabled_plugins(enabled_plugins)
     return plugin_name in plugin_options
+
+
+def get_current_plugin_options(plugin_name: str) -> Optional[str]:
+    """在响应拦截器回调内部读取当前插件的参数。
+
+    该函数利用 ContextVar 获取当前调用链的 enabled_plugins，
+    从中解析出指定插件的 options 字符串。
+
+    仅在 apply_response_interceptors 调用回调期间有效，
+    其他时刻调用返回 None。
+
+    Args:
+        plugin_name: 插件名称
+
+    Returns:
+        插件参数字符串，未启用或无参数时返回 None
+    """
+    enabled_plugins = _current_enabled_plugins.get()
+    if not enabled_plugins:
+        return None
+    plugin_map = parse_enabled_plugins(enabled_plugins)
+    return plugin_map.get(plugin_name)
 
 
 # 类型定义
@@ -400,8 +428,8 @@ class InterceptorRegistry:
         
         按优先级顺序依次调用每个拦截器，每个拦截器可以修改响应内容。
         
-        支持插件参数：enabled_plugins 中的条目可以是 "plugin_name:options" 格式。
-        注意：响应拦截器无法直接访问 provider，如需读取参数请在请求阶段缓存。
+        enabled_plugins 会通过 ContextVar 暴露给回调，插件可通过
+        get_current_plugin_options(plugin_name) 读取自己的参数。
         
         Args:
             response_chunk: 响应数据（流式时为单个 chunk，非流式时为完整响应）
@@ -415,6 +443,9 @@ class InterceptorRegistry:
             经过所有拦截器处理后的响应数据
         """
         interceptors = self.get_response_interceptors(enabled_only=True)
+        
+        # 将 enabled_plugins 写入 ContextVar，供回调通过 get_current_plugin_options() 读取
+        token = _current_enabled_plugins.set(enabled_plugins)
         
         # 解析 enabled_plugins，提取插件名（忽略参数部分用于过滤）
         enabled_plugin_names = None
@@ -435,6 +466,9 @@ class InterceptorRegistry:
             except Exception as e:
                 logger.error(f"Response interceptor '{interceptor.id}' error: {e}")
                 # 继续执行其他拦截器
+        
+        # 恢复 ContextVar
+        _current_enabled_plugins.reset(token)
         
         return response_chunk
     
@@ -664,3 +698,70 @@ async def apply_response_interceptors(
     return await get_interceptor_registry().apply_response_interceptors(
         response_chunk, engine, model, is_stream, enabled_plugins
     )
+
+# ==================== 透明 Client 包装 ====================
+
+class InterceptedClient:
+    """
+    httpx.AsyncClient 的透明包装。
+
+    在每次 HTTP 请求发出前，自动将 url 和 headers 传入请求拦截器链，
+    让已启用的插件有机会修改请求头（如认证方式转换）。
+
+    用于 models_adapter 等不经过 get_payload 的请求路径，
+    使其也能被插件拦截，无需修改任何渠道代码。
+
+    用法::
+
+        from core.plugins.interceptors import InterceptedClient
+
+        wrapped = InterceptedClient(client, engine, provider, enabled_plugins)
+        # 之后将 wrapped 当作普通 httpx.AsyncClient 使用即可
+    """
+
+    def __init__(
+        self,
+        client,
+        engine: str,
+        provider: Dict[str, Any],
+        enabled_plugins: Optional[List[str]] = None,
+    ):
+        self._client = client
+        self._engine = engine
+        self._provider = provider
+        self._enabled_plugins = enabled_plugins
+        api_key = provider.get("api", "")
+        self._api_key = api_key[0] if isinstance(api_key, list) and api_key else (api_key or "")
+
+    async def _intercept(self, url: str, headers: Optional[Dict] = None) -> Tuple[str, Dict]:
+        """对 url 和 headers 应用请求拦截器"""
+        headers = dict(headers or {})
+        if not self._enabled_plugins:
+            return url, headers
+        url, headers, _ = await apply_request_interceptors(
+            None, self._engine, self._provider, self._api_key,
+            str(url), headers, {},
+            self._enabled_plugins,
+        )
+        return url, headers
+
+    async def get(self, url, *, headers=None, **kwargs):
+        url, headers = await self._intercept(url, headers)
+        return await self._client.get(url, headers=headers, **kwargs)
+
+    async def post(self, url, *, headers=None, **kwargs):
+        url, headers = await self._intercept(url, headers)
+        return await self._client.post(url, headers=headers, **kwargs)
+
+    @asynccontextmanager
+    async def _stream_intercepted(self, method, url, *, headers=None, **kwargs):
+        url, headers = await self._intercept(url, headers)
+        async with self._client.stream(method, url, headers=headers, **kwargs) as response:
+            yield response
+
+    def stream(self, method, url, *, headers=None, **kwargs):
+        return self._stream_intercepted(method, url, headers=headers, **kwargs)
+
+    def __getattr__(self, name):
+        """未覆盖的属性和方法直接转发到原始 client"""
+        return getattr(self._client, name)

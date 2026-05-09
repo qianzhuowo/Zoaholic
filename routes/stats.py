@@ -12,10 +12,10 @@ from pydantic import BaseModel, field_serializer, Field
 from sqlalchemy import select, case, func, desc, update, delete, or_
 
 from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, DB_TYPE
-from core.stats import get_usage_data
+from core.stats import get_usage_data, compute_total_cost_from_db
 from utils import safe_get, query_channel_key_stats
 from routes.deps import rate_limit_dependency, verify_api_key, verify_admin_api_key, get_app
-from core.d1_client import format_d1_datetime, parse_d1_datetime
+from core.d1_client import parse_d1_datetime, format_d1_datetime
 
 router = APIRouter()
 
@@ -50,7 +50,6 @@ class QueryDetails(BaseModel):
 
     start_datetime: Optional[str] = None
     end_datetime: Optional[str] = None
-    provider_filter: Optional[str] = None
     api_key_filter: Optional[str] = None
     model_filter: Optional[str] = None
     credits: Optional[str] = None
@@ -63,35 +62,14 @@ class TokenUsageResponse(BaseModel):
     query_details: QueryDetails
 
 
-class UsageAnalysisEntry(BaseModel):
-    provider: str
-    model: str
-    request_count: int
-    total_prompt_tokens: int
-    total_completion_tokens: int
-    total_tokens: int
-
-
-class UsageAnalysisSummary(BaseModel):
-    provider_count: int
-    model_count: int
-    request_count: int
-    total_prompt_tokens: int
-    total_completion_tokens: int
-    total_tokens: int
-
-
-class UsageAnalysisResponse(BaseModel):
-    usage: List[UsageAnalysisEntry]
-    summary: UsageAnalysisSummary
-    query_details: QueryDetails
-
-
 class ChannelKeyRanking(BaseModel):
     api_key: str
     success_count: int
     total_requests: int
     success_rate: float
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 class ChannelKeyRankingsResponse(BaseModel):
@@ -137,8 +115,13 @@ class LogEntry(BaseModel):
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # Prompt Caching 统计随日志返回给前端，用于列表摘要和展开详情展示。
+    cached_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     success: bool = False
     status_code: Optional[int] = None
+    prompt_price: Optional[float] = None
+    completion_price: Optional[float] = None
     is_flagged: bool = False
     
     # 扩展日志字段
@@ -150,7 +133,12 @@ class LogEntry(BaseModel):
     retry_path: Optional[str] = None  # JSON格式的重试路径
     request_headers: Optional[str] = None  # 用户请求头
     request_body: Optional[str] = None  # 用户请求体
+    # 修改原因：前端日志详情需要展示上游请求头和上游响应头，响应模型必须显式暴露这些字段。
+    # 修改方式：在 LogEntry 中补齐 upstream_request_headers 与 upstream_response_headers。
+    # 目的：避免 response_model 过滤掉数据库中已经保存的头信息。
+    upstream_request_headers: Optional[str] = None  # 发送到上游的请求头
     upstream_request_body: Optional[str] = None  # 发送到上游的请求体
+    upstream_response_headers: Optional[str] = None  # 上游返回的响应头
     upstream_response_body: Optional[str] = None  # 上游返回的响应体
     response_body: Optional[str] = None  # 返回给用户的响应体
     raw_data_expires_at: Optional[datetime] = None  # 原始数据过期时间
@@ -180,36 +168,16 @@ class LogsPage(BaseModel):
     total_pages: int
 
 
-class BackendLogEntry(BaseModel):
-    id: int
-    captured_at: datetime
-    stream: Literal["stdout", "stderr"]
-    level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]] = None
-    logger_name: Optional[str] = None
-    source: Literal["stream", "logger"] = "stream"
-    message: str
-
-    @field_serializer("captured_at")
-    def serialize_dt(self, dt: datetime):
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-
-
-class BackendLogsPage(BaseModel):
-    items: List[BackendLogEntry]
-    total: int
-    limit: int
-    max_id: int
-    buffer_size: int
-
-
 # 可手动清理的日志字段（大字段优先）
 LOG_CLEARABLE_FIELDS: Dict[str, str] = {
     "request_headers": "用户请求头(request_headers)",
     "request_body": "用户请求体(request_body)",
     "upstream_request_headers": "上游请求头(upstream_request_headers)",
     "upstream_request_body": "上游请求体(upstream_request_body)",
+    # 修改原因：新增上游响应头后，日志清理接口也需要允许清空该字段。
+    # 修改方式：把 upstream_response_headers 加入后端清理白名单。
+    # 目的：保持 Settings.tsx 可选字段与后端可清理字段一致。
+    "upstream_response_headers": "上游响应头(upstream_response_headers)",
     "upstream_response_body": "上游响应体(upstream_response_body)",
     "response_body": "返回给用户的响应体(response_body)",
     "retry_path": "重试路径(retry_path)",
@@ -221,6 +189,10 @@ DEFAULT_LOG_CLEANUP_FIELDS: List[str] = [
     "request_body",
     "upstream_request_headers",
     "upstream_request_body",
+    # 修改原因：默认清理原始日志数据时也应覆盖新增的上游响应头字段。
+    # 修改方式：将 upstream_response_headers 加入 DEFAULT_LOG_CLEANUP_FIELDS。
+    # 目的：避免自动默认选择遗漏该字段导致旧响应头长期保留。
+    "upstream_response_headers",
     "upstream_response_body",
     "response_body",
     "retry_path",
@@ -398,6 +370,7 @@ async def get_stats(
     
     start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
+    total_cost = 0.0
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
         if d1_client is None:
@@ -531,6 +504,12 @@ async def get_stats(
                 .order_by(desc('count'))
             )
             ip_stats = [{"client_ip": stat.client_ip, "count": int(stat.count or 0)} for stat in ip_stats_rs.fetchall()]
+    # 计算选定时间范围内的总费用
+    try:
+        total_cost = await compute_total_cost_from_db(start_dt_obj=start_time)
+    except Exception:
+        total_cost = 0.0
+
 
     stats = {
         "time_range": f"Last {hours} hours",
@@ -566,101 +545,108 @@ async def get_stats(
                 "ip": stat.get("client_ip"),
                 "count": stat.get("count", 0)
             } for stat in ip_stats
-        ]
+        ],
+        "total_cost": round(total_cost, 6),
     }
 
     return JSONResponse(content=stats)
 
 
-@router.get(
-    "/v1/stats/usage_analysis",
-    response_model=UsageAnalysisResponse,
-    dependencies=[Depends(rate_limit_dependency)],
-)
+# ============ Usage Analysis (用量分析与费用模拟) ============
+
+class UsageAnalysisEntry(BaseModel):
+    provider: str
+    model: str
+    request_count: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+@router.get("/v1/stats/usage_analysis", dependencies=[Depends(rate_limit_dependency)])
 async def get_usage_analysis(
     request: Request,
     token: str = Depends(verify_admin_api_key),
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    hours: Optional[int] = Query(default=24, ge=1, le=8760, description="Lookback hours (used when start/end not provided)"),
     provider: Optional[str] = Query(default=None, description="Provider filter, comma-separated for multiple"),
     model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
-    start_datetime: Optional[str] = Query(default=None, description="ISO start datetime"),
-    end_datetime: Optional[str] = Query(default=None, description="ISO end datetime"),
-    hours: int = Query(default=24, ge=1, le=8760, description="Number of hours to look back when no explicit datetime range is provided"),
 ):
-    """基础版用量分析：按 provider + model 聚合，并支持时间范围过滤。"""
+    """
+    按渠道和模型分组的用量分析，返回请求次数、Token 消耗量和基于当前配置价格的实时费用。
+    """
     if DISABLE_DATABASE:
-        raise HTTPException(status_code=503, detail="Database is disabled.")
+        return JSONResponse(content={"data": []})
 
     now = datetime.now(timezone.utc)
-    start_dt_obj = None
-    end_dt_obj = None
+    start_dt = None
+    end_dt = None
 
-    provider_list = [item.strip() for item in provider.split(',') if item.strip()] if provider else []
-    model_list = [item.strip() for item in model.split(',') if item.strip()] if model else []
+    provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
+    model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
 
-    try:
-        if start_datetime:
-            start_dt_obj = parse_datetime_input(start_datetime)
-        if end_datetime:
-            end_dt_obj = parse_datetime_input(end_datetime)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if start_datetime or end_datetime:
+        try:
+            if start_datetime:
+                start_dt = parse_datetime_input(start_datetime)
+            if end_datetime:
+                end_dt = parse_datetime_input(end_datetime)
+            if start_dt and end_dt and end_dt < start_dt:
+                raise HTTPException(status_code=400, detail="end_datetime cannot be before start_datetime.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        start_dt = now - timedelta(hours=hours or 24)
+        end_dt = now
 
-    if start_dt_obj is None and end_dt_obj is None:
-        end_dt_obj = now
-        start_dt_obj = now - timedelta(hours=hours)
-    elif start_dt_obj is None and end_dt_obj is not None:
-        start_dt_obj = end_dt_obj - timedelta(hours=hours)
-    elif start_dt_obj is not None and end_dt_obj is None:
-        end_dt_obj = now
-
-    if start_dt_obj and end_dt_obj and end_dt_obj < start_dt_obj:
-        raise HTTPException(status_code=400, detail="end_datetime cannot be before start_datetime.")
-
-    usage_rows: List[Dict[str, Any]] = []
+    start_detail = start_dt.isoformat(timespec='seconds') if start_dt else None
+    end_detail = end_dt.isoformat(timespec='seconds') if end_dt else None
 
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
-
         if d1_client is None:
-            raise HTTPException(status_code=503, detail="D1 client is not available.")
+            return JSONResponse(content={"data": []})
 
         sql = (
-            "SELECT provider, model, COUNT(id) AS request_count, "
+            "SELECT provider, model, COUNT(*) AS request_count, "
             "COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens, "
             "COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens, "
             "COALESCE(SUM(total_tokens), 0) AS total_tokens "
-            "FROM request_stats WHERE provider IS NOT NULL AND provider != '' "
-            "AND model IS NOT NULL AND model != ''"
+            "FROM request_stats WHERE 1=1"
         )
-        params: List[Any] = []
+        params: list = []
+        if start_dt:
+            sql += " AND timestamp >= ?"
+            params.append(start_dt)
+        if end_dt:
+            sql += " AND timestamp <= ?"
+            params.append(end_dt)
         if provider_list:
             if len(provider_list) == 1:
                 sql += " AND provider = ?"
                 params.append(provider_list[0])
             else:
-                sql += f" AND provider IN ({','.join(['?'] * len(provider_list))})"
+                placeholders = ','.join(['?'] * len(provider_list))
+                sql += f" AND provider IN ({placeholders})"
                 params.extend(provider_list)
         if model_list:
             if len(model_list) == 1:
                 sql += " AND model = ?"
                 params.append(model_list[0])
             else:
-                sql += f" AND model IN ({','.join(['?'] * len(model_list))})"
+                placeholders = ','.join(['?'] * len(model_list))
+                sql += f" AND model IN ({placeholders})"
                 params.extend(model_list)
-        if start_dt_obj:
-            sql += " AND timestamp >= ?"
-            params.append(format_d1_datetime(start_dt_obj))
-        if end_dt_obj:
-            sql += " AND timestamp < ?"
-            params.append(format_d1_datetime(end_dt_obj))
-
-        sql += " GROUP BY provider, model ORDER BY total_tokens DESC, request_count DESC"
+        sql += " AND provider IS NOT NULL AND provider != ''"
+        sql += " AND model IS NOT NULL AND model != ''"
+        sql += " GROUP BY provider, model ORDER BY request_count DESC"
 
         rows = await d1_client.query_all(sql, params)
-        usage_rows = [
+        data = [
             {
-                "provider": row.get("provider") or "",
-                "model": row.get("model") or "",
+                "provider": row.get("provider", ""),
+                "model": row.get("model", ""),
                 "request_count": int(row.get("request_count") or 0),
                 "total_prompt_tokens": int(row.get("total_prompt_tokens") or 0),
                 "total_completion_tokens": int(row.get("total_completion_tokens") or 0),
@@ -670,19 +656,18 @@ async def get_usage_analysis(
         ]
     else:
         async with async_session_scope() as session:
-            query = (
-                select(
-                    RequestStat.provider,
-                    RequestStat.model,
-                    func.count(RequestStat.id).label("request_count"),
-                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("total_prompt_tokens"),
-                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("total_completion_tokens"),
-                    func.coalesce(func.sum(RequestStat.total_tokens), 0).label("total_tokens"),
-                )
-                .where(RequestStat.provider.isnot(None), RequestStat.provider != "")
-                .where(RequestStat.model.isnot(None), RequestStat.model != "")
+            query = select(
+                RequestStat.provider,
+                RequestStat.model,
+                func.count().label('request_count'),
+                func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label('total_prompt_tokens'),
+                func.coalesce(func.sum(RequestStat.completion_tokens), 0).label('total_completion_tokens'),
+                func.coalesce(func.sum(RequestStat.total_tokens), 0).label('total_tokens'),
             )
-
+            if start_dt:
+                query = query.where(RequestStat.timestamp >= start_dt)
+            if end_dt:
+                query = query.where(RequestStat.timestamp <= end_dt)
             if provider_list:
                 if len(provider_list) == 1:
                     query = query.where(RequestStat.provider == provider_list[0])
@@ -693,17 +678,20 @@ async def get_usage_analysis(
                     query = query.where(RequestStat.model == model_list[0])
                 else:
                     query = query.where(RequestStat.model.in_(model_list))
-            if start_dt_obj:
-                query = query.where(RequestStat.timestamp >= start_dt_obj)
-            if end_dt_obj:
-                query = query.where(RequestStat.timestamp < end_dt_obj)
+            query = query.where(
+                RequestStat.provider.isnot(None),
+                RequestStat.provider != '',
+                RequestStat.model.isnot(None),
+                RequestStat.model != '',
+            )
+            query = query.group_by(RequestStat.provider, RequestStat.model)
+            query = query.order_by(desc('request_count'))
 
-            query = query.group_by(RequestStat.provider, RequestStat.model).order_by(desc("total_tokens"), desc("request_count"))
             result = await session.execute(query)
-            usage_rows = [
+            data = [
                 {
-                    "provider": row.provider or "",
-                    "model": row.model or "",
+                    "provider": row.provider,
+                    "model": row.model,
                     "request_count": int(row.request_count or 0),
                     "total_prompt_tokens": int(row.total_prompt_tokens or 0),
                     "total_completion_tokens": int(row.total_completion_tokens or 0),
@@ -712,27 +700,26 @@ async def get_usage_analysis(
                 for row in result.fetchall()
             ]
 
-    summary = UsageAnalysisSummary(
-        provider_count=len({row["provider"] for row in usage_rows if row.get("provider")} ),
-        model_count=len({row["model"] for row in usage_rows if row.get("model")} ),
-        request_count=sum(row.get("request_count", 0) for row in usage_rows),
-        total_prompt_tokens=sum(row.get("total_prompt_tokens", 0) for row in usage_rows),
-        total_completion_tokens=sum(row.get("total_completion_tokens", 0) for row in usage_rows),
-        total_tokens=sum(row.get("total_tokens", 0) for row in usage_rows),
-    )
+    # 用当前配置价格实时计算每行费用（渠道级 > 全局级 > 0）
+    from core.stats import get_current_model_prices
+    app = get_app()
+    for entry in data:
+        prompt_price, completion_price = get_current_model_prices(
+            app, entry["model"], provider_name=entry["provider"]
+        )
+        entry["total_cost"] = (
+            entry["total_prompt_tokens"] * prompt_price
+            + entry["total_completion_tokens"] * completion_price
+        ) / 1_000_000
 
-    query_details = QueryDetails(
-        start_datetime=start_dt_obj.isoformat(timespec="seconds") if start_dt_obj else None,
-        end_datetime=end_dt_obj.isoformat(timespec="seconds") if end_dt_obj else None,
-        provider_filter=provider or "all",
-        model_filter=model or "all",
-    )
+    return JSONResponse(content={
+        "data": data,
+        "start_datetime": start_detail,
+        "end_datetime": end_detail,
+        "provider_filter": provider or "all",
+        "model_filter": model or "all",
+    })
 
-    return UsageAnalysisResponse(
-        usage=[UsageAnalysisEntry(**row) for row in usage_rows],
-        summary=summary,
-        query_details=query_details,
-    )
 
 
 @router.get("/v1/stats/model_trend", dependencies=[Depends(rate_limit_dependency)])
@@ -741,60 +728,56 @@ async def get_model_trend(
     token: str = Depends(verify_admin_api_key),
     start_datetime: Optional[str] = None,
     end_datetime: Optional[str] = None,
-    hours: int = Query(default=24, ge=1, le=8760),
-    provider: Optional[str] = Query(default=None, description="Provider filter, comma-separated for multiple"),
-    model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
+    hours: Optional[int] = Query(default=24, ge=1, le=8760),
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
 ):
-    """按小时聚合所选模型的请求趋势，用于仪表盘折线图展示。"""
+    """
+    获取筛选模型的时间趋势数据，用于折线图展示。
+    按小时聚合请求次数和 token 使用量。
+    """
     if DISABLE_DATABASE:
-        return JSONResponse(content={"data": [], "models": []})
+        return JSONResponse(content={"data": []})
 
     now = datetime.now(timezone.utc)
-    try:
-        start_dt = parse_datetime_input(start_datetime) if start_datetime else (now - timedelta(hours=hours or 24))
-        end_dt = parse_datetime_input(end_datetime) if end_datetime else now
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    start_dt = parse_datetime_input(start_datetime) if start_datetime else (now - timedelta(hours=hours or 24))
+    end_dt = parse_datetime_input(end_datetime) if end_datetime else now
 
-    if end_dt < start_dt:
-        raise HTTPException(status_code=400, detail="end_datetime cannot be before start_datetime.")
-
-    provider_list = [item.strip() for item in provider.split(',') if item.strip()] if provider else []
-    model_list = [item.strip() for item in model.split(',') if item.strip()] if model else []
+    provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
+    model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
 
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
-
-        if d1_client is None:
-            return JSONResponse(content={"data": [], "models": []})
-
+        # D1/SQLite 使用 strftime 聚合。D1 存储的是字符串，通常格式为 'YYYY-MM-DD HH:MM:SS'
+        # 我们将其截断到小时 'YYYY-MM-DD HH'
         time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
         sql = f"""
             SELECT {time_group} AS hour, model, COUNT(*) AS count,
-            COALESCE(SUM(total_tokens), 0) AS tokens
-            FROM request_stats
-            WHERE timestamp >= ? AND timestamp <= ?
-              AND model IS NOT NULL AND model != ''
+            SUM(COALESCE(total_tokens, 0)) AS tokens
+            FROM request_stats WHERE timestamp >= ? AND timestamp <= ?
         """
-        params: List[Any] = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
+        params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
         if provider_list:
-            sql += f" AND provider IN ({','.join(['?'] * len(provider_list))})"
+            sql += f" AND provider IN ({','.join(['?']*len(provider_list))})"
             params.extend(provider_list)
         if model_list:
-            sql += f" AND model IN ({','.join(['?'] * len(model_list))})"
+            sql += f" AND model IN ({','.join(['?']*len(model_list))})"
             params.extend(model_list)
+        sql += " AND model IS NOT NULL AND model != ''"
         sql += " GROUP BY hour, model ORDER BY hour ASC"
+        
         rows = await d1_client.query_all(sql, params)
-        raw_data = rows
+        data = rows
     else:
         async with async_session_scope() as session:
+            # PostgreSQL/MySQL 等数据库使用不同的日期截断函数
             if (DB_TYPE or "").lower() == "postgres":
                 time_group = func.date_trunc('hour', RequestStat.timestamp)
                 order_expr = time_group
             elif (DB_TYPE or "").lower() == "mysql":
                 time_group = func.date_format(RequestStat.timestamp, '%Y-%m-%d %H:00:00')
                 order_expr = time_group
-            else:
+            else: # SQLite fallback
                 time_group = func.strftime('%Y-%m-%d %H:00:00', RequestStat.timestamp)
                 order_expr = time_group
 
@@ -802,43 +785,50 @@ async def get_model_trend(
                 time_group.label('hour'),
                 RequestStat.model,
                 func.count().label('count'),
-                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens'),
-            ).where(
-                RequestStat.timestamp >= start_dt,
-                RequestStat.timestamp <= end_dt,
-                RequestStat.model.isnot(None),
-                RequestStat.model != '',
-            )
+                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens')
+            ).where(RequestStat.timestamp >= start_dt, RequestStat.timestamp <= end_dt)
 
             if provider_list:
                 query = query.where(RequestStat.provider.in_(provider_list))
             if model_list:
                 query = query.where(RequestStat.model.in_(model_list))
-
+            query = query.where(
+         RequestStat.model.isnot(None),
+      RequestStat.model != ''
+            )
+            
             query = query.group_by(time_group, RequestStat.model).order_by(order_expr)
             result = await session.execute(query)
-            raw_data = [
-                {"hour": str(row.hour), "model": row.model, "count": int(row.count or 0), "tokens": int(row.tokens or 0)}
+            data = [
+                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0)}
                 for row in result.fetchall()
             ]
 
-    chart_dict: Dict[str, Dict[str, Any]] = {}
+    chart_dict = {}
+    tokens_chart_dict = {}
     models_seen = set()
-    for item in raw_data:
-        hour = item["hour"]
-        model_name = item["model"]
-        models_seen.add(model_name)
-        if hour not in chart_dict:
-            chart_dict[hour] = {"hour": hour}
-        chart_dict[hour][model_name] = int(item.get("count") or 0)
+    for item in data:
+        h = item['hour']
+        m = item['model']
+        models_seen.add(m)
+        if h not in chart_dict:
+            chart_dict[h] = {"hour": h}
+        if h not in tokens_chart_dict:
+            tokens_chart_dict[h] = {"hour": h}
+        chart_dict[h][m] = item['count']
+        tokens_chart_dict[h][m] = item.get('tokens', 0) or 0
 
-    chart_data = sorted(chart_dict.values(), key=lambda item: item["hour"])
+    chart_data = sorted(chart_dict.values(), key=lambda x: x['hour'])
+    tokens_chart_data = sorted(tokens_chart_dict.values(), key=lambda x: x['hour'])
+
     return JSONResponse(content={
         "data": chart_data,
-        "models": sorted(models_seen),
+        "tokens_data": tokens_chart_data,
+        "models": sorted(list(models_seen)),
         "start_datetime": start_dt.isoformat(),
         "end_datetime": end_dt.isoformat(),
     })
+
 
 
 @router.get("/v1/token_usage", response_model=TokenUsageResponse, dependencies=[Depends(rate_limit_dependency)])
@@ -1056,6 +1046,9 @@ async def add_credits_to_api_key(
     为指定的 API key 添加额度
     """
     from core.log_config import logger
+    from utils import update_config, save_config_to_db, save_api_yaml
+    from core.env import env_bool
+    import os
     
     app = get_app()
     
@@ -1066,6 +1059,29 @@ async def add_credits_to_api_key(
         )
 
     app.state.paid_api_keys_states[paid_key]["credits"] += float(amount)
+
+    # 持久化：同步回写 app.state.config 中的 credits
+    try:
+        api_list = getattr(app.state, 'api_list', []) or []
+        if paid_key in api_list:
+            key_index = api_list.index(paid_key)
+            api_keys = app.state.config.get('api_keys', [])
+            if key_index < len(api_keys) and isinstance(api_keys[key_index], dict):
+                if 'preferences' not in api_keys[key_index]:
+                    api_keys[key_index]['preferences'] = {}
+                api_keys[key_index]['preferences']['credits'] = app.state.paid_api_keys_states[paid_key]["credits"]
+                # 首次设置 credits 时自动写入计费起始时间
+                if not api_keys[key_index]['preferences'].get('created_at'):
+                    from datetime import datetime, timezone
+                    api_keys[key_index]['preferences']['created_at'] = datetime.now(timezone.utc)
+
+                config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
+                if config_storage in ("file", "auto") or env_bool("SYNC_CONFIG_TO_FILE", False):
+                    save_api_yaml(app.state.config)
+                if config_storage in ("auto", "db"):
+                    await save_config_to_db(app.state.config)
+    except Exception as e:
+        logger.warning(f"Failed to persist credits change: {e}")
 
     current_credits = app.state.paid_api_keys_states[paid_key]["credits"]
     total_cost = app.state.paid_api_keys_states[paid_key]["total_cost"]
@@ -1412,8 +1428,13 @@ async def get_logs(
                     prompt_tokens=int(row.get("prompt_tokens") or 0),
                     completion_tokens=int(row.get("completion_tokens") or 0),
                     total_tokens=int(row.get("total_tokens") or 0),
+                    # D1 旧表可能尚无缓存列，使用 get 默认 0 保持兼容。
+                    cached_tokens=int(row.get("cached_tokens") or 0),
+                    cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
                     success=_bool_from_db(row.get("success")),
                     status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
+                    prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
+                    completion_price=float(row.get("completion_price")) if row.get("completion_price") is not None else None,
                     is_flagged=_bool_from_db(row.get("is_flagged")),
                     provider_id=row.get("provider_id"),
                     provider_key_index=int(row.get("provider_key_index")) if row.get("provider_key_index") is not None else None,
@@ -1423,7 +1444,12 @@ async def get_logs(
                     retry_path=row.get("retry_path") if not raw_data_expired else None,
                     request_headers=row.get("request_headers") if not raw_data_expired else None,
                     request_body=row.get("request_body") if not raw_data_expired else None,
+                    # 修改原因：D1 查询使用字典行，必须把新增头字段传入 LogEntry。
+                    # 修改方式：按原始数据过期规则读取上下游头字段。
+                    # 目的：保证未过期日志能在前端展示上游请求头和上游响应头。
+                    upstream_request_headers=row.get("upstream_request_headers") if not raw_data_expired else None,
                     upstream_request_body=row.get("upstream_request_body") if not raw_data_expired else None,
+                    upstream_response_headers=row.get("upstream_response_headers") if not raw_data_expired else None,
                     upstream_response_body=row.get("upstream_response_body") if not raw_data_expired else None,
                     response_body=row.get("response_body") if not raw_data_expired else None,
                     raw_data_expires_at=raw_expires_at,
@@ -1549,8 +1575,13 @@ async def get_logs(
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
+                # SQLAlchemy 分支直接读取 ORM 字段，旧数据为空时前端按 0 展示。
+                cached_tokens=getattr(row, 'cached_tokens', 0) or 0,
+                cache_creation_tokens=getattr(row, 'cache_creation_tokens', 0) or 0,
                 success=row.success if hasattr(row, 'success') else False,
                 status_code=row.status_code if hasattr(row, 'status_code') else None,
+                prompt_price=getattr(row, 'prompt_price', None),
+                completion_price=getattr(row, 'completion_price', None),
                 is_flagged=row.is_flagged,
                 # 扩展日志字段
                 provider_id=row.provider_id,
@@ -1561,7 +1592,12 @@ async def get_logs(
                 retry_path=row.retry_path if not raw_data_expired else None,
                 request_headers=row.request_headers if not raw_data_expired else None,
                 request_body=row.request_body if not raw_data_expired else None,
+                # 修改原因：SQLAlchemy 查询分支也需要返回新增头字段，不能只在 D1 分支处理。
+                # 修改方式：用 getattr 兼容旧 ORM 对象，并沿用原始数据过期隐藏逻辑。
+                # 目的：保证 SQLite、PostgreSQL 和 MySQL 模式下前端日志详情字段完整。
+                upstream_request_headers=getattr(row, 'upstream_request_headers', None) if not raw_data_expired else None,
                 upstream_request_body=getattr(row, 'upstream_request_body', None) if not raw_data_expired else None,
+                upstream_response_headers=getattr(row, 'upstream_response_headers', None) if not raw_data_expired else None,
                 upstream_response_body=getattr(row, 'upstream_response_body', None) if not raw_data_expired else None,
                 response_body=row.response_body if not raw_data_expired else None,
                 raw_data_expires_at=row.raw_data_expires_at,
@@ -1577,46 +1613,160 @@ async def get_logs(
     )
 
 
-@router.get("/v1/backend_logs", response_model=BackendLogsPage, dependencies=[Depends(rate_limit_dependency)])
+# ==================== 后台日志 & 出站请求日志 ====================
+
+
+@router.get("/v1/backend_logs", dependencies=[Depends(rate_limit_dependency)])
 async def get_backend_logs(
-    limit: int = Query(200, ge=1, le=2000, description="Maximum number of backend log lines to return"),
-    since_id: Optional[int] = Query(None, ge=0, description="Return log lines whose id is greater than this value"),
-    search: Optional[str] = Query(None, description="Keyword filter for backend log content"),
-    stream: Optional[str] = Query(None, description="Filter by output stream: stdout or stderr"),
-    level: Optional[str] = Query(None, description="Filter by log level: debug, info, warning, error or critical"),
-    level_group: Optional[str] = Query(None, description="Filter by log level group: errors (ERROR + CRITICAL)"),
-    logger_name: Optional[str] = Query(None, description="Filter by logger name (case-insensitive exact match)"),
+    request: Request,
+    since_id: Optional[int] = Query(None, description="Only return entries with id > since_id"),
+    limit: int = Query(200, ge=1, le=2000, description="Max entries to return"),
+    search: Optional[str] = Query(None, description="Search keyword (case-insensitive)"),
+    stream: Optional[str] = Query(None, description="Filter by stream: stdout or stderr"),
+    level: Optional[str] = Query(None, description="Filter by exact log level: DEBUG/INFO/WARNING/ERROR/CRITICAL"),
+    level_group: Optional[str] = Query(None, description="Filter by level group: errors (ERROR+CRITICAL)"),
+    logger_name: Optional[str] = Query(None, description="Filter by logger name (exact, case-insensitive)"),
     token: str = Depends(verify_admin_api_key),
 ):
-    normalized_stream = (stream or "").strip().lower() or None
-    if normalized_stream not in {None, "stdout", "stderr"}:
-        raise HTTPException(status_code=400, detail="Invalid stream. Allowed values: stdout, stderr")
-
-    normalized_level = (level or "").strip().upper() or None
-    if normalized_level not in {None, "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-        raise HTTPException(status_code=400, detail="Invalid level. Allowed values: debug, info, warning, error, critical")
-
-    normalized_level_group = (level_group or "").strip().lower() or None
-    if normalized_level_group not in {None, "errors"}:
-        raise HTTPException(status_code=400, detail="Invalid level_group. Allowed values: errors")
-
+    """
+    获取后台进程日志（stdout/stderr 内存缓冲区）。
+    仅管理员可访问，不依赖数据库。
+    """
     from core.log_config import get_backend_log_entries
 
-    snapshot = get_backend_log_entries(
+    result = get_backend_log_entries(
         since_id=since_id,
         limit=limit,
         search=search,
-        stream=normalized_stream,
-        level=normalized_level,
-        level_group=normalized_level_group,
+        stream=stream,
+        level=level,
+        level_group=level_group,
         logger_name=logger_name,
     )
 
-    items = [BackendLogEntry(**item) for item in snapshot["items"]]
-    return BackendLogsPage(
-        items=items,
-        total=int(snapshot["total"]),
+    # 将 datetime 对象转为 ISO 字符串
+    for item in result.get("items", []):
+        if hasattr(item.get("captured_at"), "isoformat"):
+            item["captured_at"] = item["captured_at"].isoformat()
+
+    return JSONResponse(content=result)
+
+
+@router.get("/v1/outbound_logs", dependencies=[Depends(rate_limit_dependency)])
+async def get_outbound_logs(
+    request: Request,
+    since_id: Optional[int] = Query(None, description="Only return entries with id > since_id"),
+    limit: int = Query(200, ge=1, le=2000, description="Max entries to return"),
+    host: Optional[str] = Query(None, description="Filter by target host (fuzzy)"),
+    method: Optional[str] = Query(None, description="Filter by HTTP method: GET/POST/..."),
+    status_min: Optional[int] = Query(None, description="Min status code (inclusive)"),
+    status_max: Optional[int] = Query(None, description="Max status code (inclusive)"),
+    search: Optional[str] = Query(None, description="Search keyword in URL (case-insensitive)"),
+    token: str = Depends(verify_admin_api_key),
+):
+    """
+    获取后端出站 HTTP 请求日志（内存缓冲区）。
+    记录所有通过 httpx.AsyncClient 发出的请求。
+    仅管理员可访问，不依赖数据库。
+    """
+    from core.http import get_outbound_log_entries
+
+    result = get_outbound_log_entries(
+        since_id=since_id,
         limit=limit,
-        max_id=int(snapshot["max_id"]),
-        buffer_size=int(snapshot["buffer_size"]),
+        host=host,
+        method=method,
+        status_min=status_min,
+        status_max=status_max,
+        search=search,
     )
+    return JSONResponse(content=result)
+
+
+# ── 内存级 provider 活跃度缓存 ──
+import time as _time
+_provider_last_seen: dict[str, float] = {}  # provider → unix timestamp
+_activity_warmed = False
+
+def record_provider_activity(provider: str):
+    """每次请求经过时调用，O(1) 写入内存"""
+    if provider:
+        _provider_last_seen[provider] = _time.time()
+
+async def warm_provider_activity():
+    """启动时从 DB 预热缓存（后台执行，不阻塞启动）"""
+    global _activity_warmed
+    try:
+        from db import DISABLE_DATABASE, DB_TYPE
+        if DISABLE_DATABASE:
+            _activity_warmed = True
+            return
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            _activity_warmed = True
+            return
+        from db import async_session_scope, RequestStat
+        from sqlalchemy import func, select
+        async with async_session_scope() as session:
+            stmt = select(
+                RequestStat.provider,
+                func.max(RequestStat.timestamp).label("last_active")
+            ).group_by(RequestStat.provider)
+            result = await session.execute(stmt)
+            for row in result.fetchall():
+                provider = row[0]
+                last_active = row[1]
+                if provider and last_active:
+                    ts = last_active.timestamp() if hasattr(last_active, 'timestamp') else _time.time()
+                    # 只填充还没有的（运行时记录优先）
+                    if provider not in _provider_last_seen:
+                        _provider_last_seen[provider] = ts
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).info(f"[provider_activity] Warmed cache from DB: {len(_provider_last_seen)} providers")
+    except Exception as e:
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).warning(f"[provider_activity] Warm failed: {e}")
+
+# 每日活跃度刷新已移至 main.py 统一 daily_maintenance 循环
+
+@router.get("/v1/stats/provider_activity", dependencies=[Depends(rate_limit_dependency)])
+async def provider_activity():
+    """
+    返回每个 provider 的最后活跃时间（从内存缓存读取，秒回）。
+    Returns: {"activity": {"provider_name": 1714567890.123, ...}, "warmed": true}
+    """
+    return JSONResponse(content={"activity": _provider_last_seen, "warmed": _activity_warmed})
+
+
+@router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
+async def resolve_prices(request: Request):
+    """
+    批量查询模型价格。走完整 6 层级联（渠道 > 全局 > 外部库 > default > 0）。
+    
+    Body: {"models": [{"model": "gpt-4o", "provider": "openai"}, ...]}
+    Returns: {"prices": {"gpt-4o": {"prompt": 2.5, "completion": 10.0}, ...}}
+    """
+    from core.stats import get_current_model_prices
+    app = get_app()
+    body = await request.json()
+    models = body.get("models", [])
+    
+    prices = {}
+    for item in models:
+        if isinstance(item, str):
+            model_name = item
+            provider_name = None
+        elif isinstance(item, dict):
+            model_name = item.get("model", "")
+            provider_name = item.get("provider")
+        else:
+            continue
+        if not model_name or model_name in prices:
+            continue
+        prompt_price, completion_price = get_current_model_prices(
+            app, model_name, provider_name=provider_name
+        )
+        prices[model_name] = {"prompt": prompt_price, "completion": completion_price}
+    
+    return JSONResponse(content={"prices": prices})

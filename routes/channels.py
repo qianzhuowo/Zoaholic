@@ -5,13 +5,14 @@ Channels 管理路由
 import os
 import json
 import copy
+import asyncio
 
 from core.env import env_bool
 import httpx
 from time import time
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from core.channels import list_channels, get_channel
@@ -21,29 +22,6 @@ from routes.deps import rate_limit_dependency, verify_admin_api_key, get_app
 
 router = APIRouter()
 is_debug = env_bool("DEBUG", False)
-
-CHANNEL_TEST_REQUEST_PATCH_WHITELIST = frozenset({
-    "logprobs",
-    "top_logprobs",
-    "stream",
-    "include_usage",
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "max_tokens",
-    "max_completion_tokens",
-    "presence_penalty",
-    "frequency_penalty",
-    "n",
-    "user",
-    "tool_choice",
-    "tools",
-    "response_format",
-    "thinking",
-    "stream_options",
-    "chat_template_kwargs",
-})
 
 
 @router.get("/v1/channels", dependencies=[Depends(rate_limit_dependency)])
@@ -55,6 +33,52 @@ async def get_channels(token: str = Depends(verify_admin_api_key)):
     channels = list_channels()
     channel_list = [ch.to_dict() for ch in channels]
     return JSONResponse(content={"channels": channel_list})
+
+
+@router.get("/v1/channels/key_status", dependencies=[Depends(rate_limit_dependency)])
+async def get_key_status(token: str = Depends(verify_admin_api_key)):
+    """获取所有渠道的运行时 Key 自动禁用状态。仅反映内存中的实时状态，不修改任何配置。"""
+    from core.utils import provider_api_circular_list
+    from time import time as _time
+
+    now = _time()
+    result = {}
+    for provider_name, circular_list in provider_api_circular_list.items():
+        auto_disabled = await circular_list.get_auto_disabled_keys()
+        cooling = []
+        for item in circular_list.items:
+            # 只返回普通冷却中（非自动禁用）的 Key
+            if item not in circular_list.auto_disabled_info and now < circular_list.cooling_until.get(item, 0):
+                until = circular_list.cooling_until[item]
+                remaining = -1 if until == float('inf') else int(until - now)
+                cooling.append({"key": item, "remaining_seconds": remaining})
+        if auto_disabled or cooling:
+            result[provider_name] = {
+                "auto_disabled": auto_disabled,
+                "cooling": cooling,
+            }
+    return JSONResponse(content=result)
+
+
+@router.post("/v1/channels/key_status/re_enable", dependencies=[Depends(rate_limit_dependency)])
+async def re_enable_key(token: str = Depends(verify_admin_api_key), body: dict = Body(...)):
+    """手动恢复被运行时自动禁用的 Key。
+
+    请求体: { "provider": "渠道名", "key": "api_key_string" }
+    """
+    from core.utils import provider_api_circular_list
+
+    provider_name = body.get("provider")
+    key = body.get("key")
+    if not provider_name or not key:
+        return JSONResponse(status_code=400, content={"error": "Missing provider or key"})
+
+    circular_list = provider_api_circular_list.get(provider_name)
+    if not circular_list:
+        return JSONResponse(status_code=404, content={"error": f"Provider '{provider_name}' not found"})
+
+    await circular_list.clear_auto_disabled(key)
+    return JSONResponse(content={"status": "re_enabled", "provider": provider_name})
 
 
 @router.post("/v1/channels/fetch_models", dependencies=[Depends(rate_limit_dependency)])
@@ -69,7 +93,7 @@ async def fetch_channel_models(
     {
         "engine": "gpt",  // 渠道类型 ID
         "base_url": "https://api.openai.com/v1",
-        "api_key": "sk-xxx 或 zk-xxx",
+        "api_key": "sk-xxx",
         // 其他渠道特定配置...
     }
     
@@ -104,10 +128,12 @@ async def fetch_channel_models(
         "aws_secret_key": provider_config.get("aws_secret_key", ""),
         # Cloudflare 特定配置
         "cf_account_id": provider_config.get("cf_account_id", ""),
+        # 透传 preferences（用于插件判断等）
+        "preferences": provider_config.get("preferences", {}),
     }
     
     # 获取代理配置
-    proxy = provider_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
+    proxy = safe_get(provider_config, "preferences", "proxy") or provider_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
     
     # 验证 base_url 格式
     base_url = provider.get("base_url", "")
@@ -117,14 +143,22 @@ async def fetch_channel_models(
         logger.info(f"Auto-prefixed base_url: {provider['base_url']}")
     
     try:
-        async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
-            # 设置超时，避免请求卡死
-            import asyncio
-            models = await asyncio.wait_for(
-                channel.models_adapter(client, provider),
-                timeout=30.0
-            )
-            return JSONResponse(content={"models": models})
+        from core.http import proxy_context
+        import asyncio
+
+        with proxy_context(proxy):
+            async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
+                # 包装 client，让请求拦截器能作用于 models_adapter 的请求
+                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                if enabled_plugins:
+                    from core.plugins.interceptors import InterceptedClient
+                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+
+                models = await asyncio.wait_for(
+                    channel.models_adapter(client, provider),
+                    timeout=30.0
+                )
+                return JSONResponse(content={"models": models})
     except Exception as e:
         # 尽量提取并返回上游的错误信息
         upstream_status = None
@@ -194,10 +228,9 @@ async def test_channel(
         // 兼容旧用法（可选）
         "engine": "openai",
         "base_url": "https://api.openai.com/v1",
-        "api_key": "sk-xxx 或 zk-xxx"
+        "api_key": "sk-xxx"
     }
     """
-    from core.request import get_payload
     from core.models import RequestModel
     from core.utils import get_model_dict
 
@@ -224,37 +257,6 @@ async def test_channel(
             if normalized:
                 results.append(normalized)
         return results
-
-    def _build_test_response(
-        *,
-        success: bool,
-        latency_ms: Optional[int],
-        message: str,
-        error: Optional[str] = None,
-        upstream_status_code: Optional[int] = None,
-        stream: bool = False,
-        response_preview: Optional[str] = None,
-        error_code: Optional[str] = None,
-        error_category: Optional[str] = None,
-        status_code: int = 200,
-    ) -> JSONResponse:
-        auth_failed = upstream_status_code in (401, 403)
-        content = {
-            "success": success,
-            "latency_ms": latency_ms,
-            "message": message,
-            "upstream_status_code": upstream_status_code,
-            "auth_failed": auth_failed,
-            "stream": bool(stream),
-            "error_category": error_category or ("success" if success else "unknown"),
-        }
-        if error is not None:
-            content["error"] = error
-        if response_preview is not None:
-            content["response_preview"] = response_preview
-        if error_code is not None:
-            content["error_code"] = error_code
-        return JSONResponse(status_code=status_code, content=content)
     
     app = get_app()
 
@@ -291,372 +293,248 @@ async def test_channel(
     except Exception:
         timeout = 30
 
-    channel = get_channel(engine)
-    if not channel:
-        raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
-
-    provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
-    provider["engine"] = engine
-
-    base_url = test_config.get("base_url") or provider.get("base_url", "")
-    base_url = str(base_url).strip() if base_url else ""
-
-    # 如果 base_url 为空，使用渠道默认值
-    if not base_url:
-        if channel.default_base_url:
-            base_url = channel.default_base_url
-            logger.info(f"Using default base_url for channel '{engine}': {base_url}")
-        else:
-            raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
-
-    # 验证 base_url 格式
-    if not base_url.startswith(("http://", "https://")):
-        # 自动添加 https:// 前缀
-        base_url = f"https://{base_url}"
-        logger.info(f"Auto-prefixed base_url: {base_url}")
-    provider["base_url"] = base_url.rstrip('/')
-
-    # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
-    explicit_api_key = test_config.get("api_key") or test_config.get("api")
+    # 修改原因：虚拟路由测试不能按单个 provider_snapshot 直连测试，否则不会经过 preferences.virtual_models 的 chain 解析。
+    # 修改方式：当前端传 virtual_route_test 或 _virtual_route_test 标记时，直接用后端当前配置解析虚拟模型候选 provider。
+    # 目的：ChannelTestDialog 中选择虚拟模型名测试时，能走与正式请求相同的虚拟路由链条。
+    virtual_route_test = bool(test_config.get("virtual_route_test") or provider.get("_virtual_route_test"))
     selected_api_key = None
-    if isinstance(explicit_api_key, str) and explicit_api_key.strip():
-        selected_api_key = explicit_api_key.strip()
-        if selected_api_key.startswith("!"):
-            selected_api_key = selected_api_key[1:]
+    override_providers = None
+
+    if virtual_route_test:
+        from core.virtual_routing import resolve_virtual_model
+
+        override_providers = resolve_virtual_model(model, app.state.config, 0, app)
+        if override_providers is None:
+            raise HTTPException(status_code=400, detail=f"model '{model}' 不是已配置的虚拟模型")
+        if not override_providers:
+            raise HTTPException(status_code=400, detail=f"虚拟模型 '{model}' 没有可用的路由链条")
     else:
-        candidates = _collect_key_candidates(provider.get("api"))
-        candidates.extend(_collect_key_candidates(provider.get("api_keys")))
+        channel = get_channel(engine)
+        if not channel:
+            raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
 
-        for key in candidates:
-            if not key.startswith("!"):
-                selected_api_key = key
-                break
+        provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
+        provider["engine"] = engine
 
-        if not selected_api_key and candidates:
-            selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
+        base_url = test_config.get("base_url") or provider.get("base_url", "")
+        base_url = str(base_url).strip() if base_url else ""
 
-    if selected_api_key:
-        provider["api"] = selected_api_key
+        # 如果 base_url 为空，使用渠道默认值
+        if not base_url:
+            if channel.default_base_url:
+                base_url = channel.default_base_url
+                logger.info(f"Using default base_url for channel '{engine}': {base_url}")
+            else:
+                raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
 
-    # 确保模型映射存在，兼容别名测试
-    provider_models = provider.get("model")
-    if not isinstance(provider_models, list):
-        fallback_models = provider.get("models")
-        provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+        # 验证 base_url 格式
+        if not base_url.startswith(("http://", "https://")):
+            # 自动添加 https:// 前缀
+            base_url = f"https://{base_url}"
+            logger.info(f"Auto-prefixed base_url: {base_url}")
+        provider["base_url"] = base_url.rstrip('/')
 
-    if not provider_models:
-        if upstream_model_hint and upstream_model_hint != model:
-            provider_models = [{upstream_model_hint: model}]
+        # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
+        explicit_api_key = test_config.get("api_key") or test_config.get("api")
+        if isinstance(explicit_api_key, str) and explicit_api_key.strip():
+            selected_api_key = explicit_api_key.strip()
+            if selected_api_key.startswith("!"):
+                selected_api_key = selected_api_key[1:]
         else:
-            provider_models = [model]
+            candidates = _collect_key_candidates(provider.get("api"))
+            candidates.extend(_collect_key_candidates(provider.get("api_keys")))
 
-    provider["model"] = provider_models
-    provider.pop("models", None)
+            for key in candidates:
+                if not key.startswith("!"):
+                    selected_api_key = key
+                    break
 
-    model_dict = get_model_dict(provider)
-    if model not in model_dict:
-        if upstream_model_hint and upstream_model_hint != model:
-            provider["model"].append({upstream_model_hint: model})
-        else:
-            provider["model"].append(model)
+            if not selected_api_key and candidates:
+                selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
+
+        if selected_api_key:
+            provider["api"] = selected_api_key
+
+        # 确保模型映射存在，兼容别名测试
+        provider_models = provider.get("model")
+        if not isinstance(provider_models, list):
+            fallback_models = provider.get("models")
+            provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+
+        if not provider_models:
+            if upstream_model_hint and upstream_model_hint != model:
+                provider_models = [{upstream_model_hint: model}]
+            else:
+                provider_models = [model]
+
+        provider["model"] = provider_models
+        provider.pop("models", None)
+
         model_dict = get_model_dict(provider)
+        prefix = provider.get('model_prefix', '').strip()
 
-    provider["_model_dict_cache"] = model_dict
+        if model not in model_dict:
+            # 前端可能传了不带前缀的模型名，尝试自动匹配带前缀的版本
+            prefixed_model = f"{prefix}{model}" if prefix else None
+            if prefixed_model and prefixed_model in model_dict:
+                model = prefixed_model
+            else:
+                if upstream_model_hint and upstream_model_hint != model:
+                    provider["model"].append({upstream_model_hint: model})
+                else:
+                    provider["model"].append(model)
+                model_dict = get_model_dict(provider)
 
-    if model not in model_dict:
-        raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
+        provider["_model_dict_cache"] = model_dict
 
-    # 构建测试请求（允许外部覆盖部分参数，便于做 Key/流式等测试）
-    # 注意：这里尽量保持「轻量」请求，避免测试时产生较大消耗。
-    import asyncio
+        if model not in model_dict:
+            raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
 
-    prompt = test_config.get("prompt") or test_config.get("text") or "Hi"
-    raw_messages = test_config.get("messages")
-    if isinstance(raw_messages, list) and raw_messages:
-        messages = raw_messages
-    else:
-        messages = [{"role": "user", "content": str(prompt)}]
+        override_providers = [provider]
 
-    raw_request_patch = test_config.get("request_patch")
-    if not isinstance(raw_request_patch, dict):
-        raw_request_patch = {}
+    # 构建测试请求（允许外部覆盖部分参数，默认保持轻量）
+    prompt = test_config.get("prompt") or "Hi"
+    messages = [{"role": "user", "content": str(prompt)}]
 
-    request_patch = {
-        key: value
-        for key, value in raw_request_patch.items()
-        if key in CHANNEL_TEST_REQUEST_PATCH_WHITELIST and value is not None
-    }
-    ignored_request_patch_keys = sorted(
-        str(key)
-        for key in raw_request_patch.keys()
-        if key not in CHANNEL_TEST_REQUEST_PATCH_WHITELIST
-    )
-    if ignored_request_patch_keys:
-        logger.info(
-            "Channel test ignored unsupported request_patch keys: %s",
-            ", ".join(ignored_request_patch_keys),
-        )
+    stream = bool(test_config.get("stream", False))
 
-    # 常用字段（显式字段优先级 > request_patch > 默认值）
-    def _get_first(*keys: str, default=None):
-        for k in keys:
-            if k in test_config and test_config.get(k) is not None:
-                return test_config.get(k)
-        if keys and keys[0] in request_patch and request_patch.get(keys[0]) is not None:
-            return request_patch.get(keys[0])
-        return default
-
-    stream = bool(_get_first("stream", default=False))
-
-    # 默认 max_tokens 设小一点即可验证可用性
-    max_tokens = _get_first("max_tokens", default=16)
+    max_tokens = test_config.get("max_tokens", 16)
     try:
-        max_tokens = int(max_tokens) if max_tokens is not None else None
+        max_tokens = int(max_tokens) if max_tokens is not None else 16
     except Exception:
         max_tokens = 16
 
-    temperature = _get_first("temperature", default=0.5)
+    temperature = test_config.get("temperature", 0.5)
     try:
-        temperature = float(temperature) if temperature is not None else None
+        temperature = float(temperature) if temperature is not None else 0.5
     except Exception:
         temperature = 0.5
 
-    top_p = _get_first("top_p", default=1.0)
-    try:
-        top_p = float(top_p) if top_p is not None else None
-    except Exception:
-        top_p = 1.0
+    test_request = RequestModel(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        stream=stream,
+        temperature=temperature,
+    )
 
-    # 仅合并显式白名单字段，避免任意 request_patch 字段透传
-    extra_request_patch = {
-        key: value
-        for key, value in request_patch.items()
-        if key not in {"stream", "max_tokens", "temperature", "top_p"}
-    }
+    # ── 走 request_model 全链路（日志、统计、插件、重试全由内核管理） ──
+    from routes.deps import get_model_handler
 
-    test_request_payload = {
-        **extra_request_patch,
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-    }
-    test_request = RequestModel(**test_request_payload)
-
-    # 获取代理配置（优先级：test_config > provider > global）
-    proxy = test_config.get("proxy")
-    if not proxy:
-        proxy = safe_get(app.state.config, "preferences", "proxy")
-        proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+    model_handler = get_model_handler()
+    if not model_handler:
+        raise HTTPException(status_code=500, detail="Model handler not initialized")
 
     start_time = time()
-    
+
     try:
-        # 使用正式链路的 payload 构建逻辑（包含参数覆写、请求插件）
-        url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
+        bg_tasks = BackgroundTasks()
 
-        # 对齐正式链路：追加渠道自定义 headers
-        custom_headers = safe_get(provider, "preferences", "headers", default={})
-        if isinstance(custom_headers, dict):
-            headers.update({str(k): str(v) for k, v in custom_headers.items() if v is not None})
+        response = await model_handler.request_model(
+            request_data=test_request,
+            api_index=0,  # override 模式下不使用
+            background_tasks=bg_tasks,
+            override_providers=override_providers,
+            force_api_key=selected_api_key,
+            override_auto_retry=virtual_route_test,
+        )
 
-        # 打印调试信息
-        try:
-            pretty_payload = json.dumps(payload, ensure_ascii=False)
-        except Exception:
-            pretty_payload = str(payload)
+        latency_ms = int((time() - start_time) * 1000)
 
-        print("[CHANNEL_TEST] engine:", engine)
-        print("[CHANNEL_TEST] url:", url)
-        print("[CHANNEL_TEST] payload:", pretty_payload)
-
-        if is_debug:
-            logger.info(f"Channel test - Engine: {engine}")
-            logger.info(f"Channel test - URL: {url}")
-            logger.info(f"Channel test - Headers: {headers}")
-            logger.info(f"Channel test - Payload (truncated): {pretty_payload[:2000]}")
-        
-        async with app.state.client_manager.get_client(url, proxy) as client:
-            # stream 测试：只读取少量响应以验证链路，不让测试请求卡住
-            if stream:
-                async with client.stream(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout,
-                ) as response:
-                    latency_ms = int((time() - start_time) * 1000)
-
-                    upstream_status_code = int(response.status_code)
-                    auth_failed = upstream_status_code in (401, 403)
-
-                    preview = ""
-                    try:
-                        it = response.aiter_text()
-                        preview = await asyncio.wait_for(it.__anext__(), timeout=min(10, timeout))
-                        preview = (preview or "")[:800]
-                    except StopAsyncIteration:
-                        preview = ""
-                    except Exception as e:
-                        preview = f"<stream preview failed: {type(e).__name__}: {e}>"[:800]
-
-                    if 200 <= upstream_status_code < 300:
-                        return _build_test_response(
-                            success=True,
-                            latency_ms=latency_ms,
-                            message="测试成功",
-                            upstream_status_code=upstream_status_code,
-                            stream=True,
-                            response_preview=preview,
-                            error_category="success",
-                        )
-
-                    # 尝试读取错误文本（避免读太多）
-                    err_text = ""
-                    try:
-                        err_text = (await response.aread()).decode("utf-8", errors="ignore")[:800]
-                    except Exception:
-                        err_text = ""
-                    if not err_text:
-                        err_text = f"HTTP {upstream_status_code}"
-
-                    return _build_test_response(
-                        success=False,
-                        latency_ms=latency_ms,
-                        message=f"HTTP {upstream_status_code}",
-                        error=err_text,
-                        upstream_status_code=upstream_status_code,
-                        stream=True,
-                        response_preview=preview,
-                        error_code="CHANNEL_TEST_UPSTREAM_AUTH_FAILED" if auth_failed else "CHANNEL_TEST_UPSTREAM_HTTP_ERROR",
-                        error_category="upstream_auth" if auth_failed else "upstream_http",
-                    )
-
-            # 非 stream：正常 post 并解析 JSON
-            response = await client.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-
-            latency_ms = int((time() - start_time) * 1000)
-            upstream_status_code = int(response.status_code)
-            auth_failed = upstream_status_code in (401, 403)
-
-            # 统一解析响应体
-            resp_json = None
-            error_detail = ""
+        # 提取响应内容用于预览
+        preview = ""
+        status_code = response.status_code
+        if hasattr(response, "body"):
             try:
-                resp_json = response.json()
+                preview = response.body.decode("utf-8", errors="ignore")[:800]
             except Exception:
-                resp_json = None
+                pass
+        elif hasattr(response, "body_iterator"):
+            chunks = []
+            total = 0
+            try:
+                async for chunk in response.body_iterator:
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode("utf-8", errors="ignore")
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > 800:
+                        break
+            except Exception:
+                pass
+            preview = "".join(chunks)[:800]
 
-            if isinstance(resp_json, dict):
-                if resp_json.get("error") is not None:
+        success = 200 <= status_code < 300
+        auth_failed = status_code in (401, 403)
+
+        # 解析错误信息，剥离 Zoaholic 内部前缀
+        def _strip_gateway_prefix(msg: str) -> str:
+            if not msg:
+                return msg
+            p = "Error: Current provider response failed: "
+            if msg.startswith(p):
+                return msg[len(p):]
+            if msg.startswith("All ") and " error: " in msg:
+                return msg.split(" error: ", 1)[1]
+            return msg
+
+        error_detail = None
+        if not success and preview:
+            try:
+                resp_json = json.loads(preview)
+                if isinstance(resp_json, dict):
                     err_obj = resp_json.get("error")
                     if isinstance(err_obj, dict):
-                        error_detail = (
-                            err_obj.get("message")
-                            or err_obj.get("code")
-                            or err_obj.get("status")
-                            or str(err_obj)
-                        )
-                    else:
-                        error_detail = str(err_obj)
-                elif resp_json.get("detail") and not resp_json.get("choices"):
-                    error_detail = str(resp_json.get("detail"))
+                        error_detail = _strip_gateway_prefix(err_obj.get("message") or str(err_obj))
+                    elif err_obj:
+                        error_detail = _strip_gateway_prefix(str(err_obj))
+                    elif resp_json.get("detail"):
+                        error_detail = str(resp_json["detail"])
+            except (json.JSONDecodeError, ValueError):
+                error_detail = _strip_gateway_prefix(preview)
 
-            if not error_detail:
-                try:
-                    body_text = response.text
-                    if body_text and body_text.strip() and response.status_code >= 400:
-                        error_detail = body_text[:800]
-                except Exception:
-                    pass
+        return JSONResponse(content={
+            "success": success,
+            "latency_ms": latency_ms,
+            "message": "测试成功" if success else f"HTTP {status_code}",
+            "error": error_detail,
+            "upstream_status_code": status_code,
+            "auth_failed": auth_failed,
+            "response_preview": preview if success else None,
+        })
 
-            is_success = 200 <= upstream_status_code < 300 and not error_detail
-
-            if is_success:
-                return _build_test_response(
-                    success=True,
-                    latency_ms=latency_ms,
-                    message="测试成功",
-                    upstream_status_code=upstream_status_code,
-                    stream=False,
-                    error_category="success",
-                )
-
-            if not error_detail:
-                error_detail = f"HTTP {upstream_status_code}"
-
-            return _build_test_response(
-                success=False,
-                latency_ms=latency_ms,
-                message=f"HTTP {upstream_status_code}",
-                error=error_detail,
-                upstream_status_code=upstream_status_code,
-                stream=False,
-                error_code="CHANNEL_TEST_UPSTREAM_AUTH_FAILED" if auth_failed else "CHANNEL_TEST_UPSTREAM_HTTP_ERROR",
-                error_category="upstream_auth" if auth_failed else "upstream_http",
-            )
-                
-    except httpx.TimeoutException:
+    except HTTPException as he:
         latency_ms = int((time() - start_time) * 1000)
-        return _build_test_response(
-            success=False,
-            latency_ms=latency_ms,
-            message="请求超时",
-            error=f"请求超时（{timeout}秒）",
-            upstream_status_code=None,
-            stream=bool(stream),
-            error_code="CHANNEL_TEST_TIMEOUT",
-            error_category="timeout",
-        )
-    except httpx.ConnectError as e:
-        return _build_test_response(
-            success=False,
-            latency_ms=None,
-            message="连接失败",
-            error=str(e),
-            upstream_status_code=None,
-            stream=bool(stream),
-            error_code="CHANNEL_TEST_CONNECT_ERROR",
-            error_category="connect",
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "latency_ms": latency_ms,
+                "message": "测试失败",
+                "error": str(he.detail) if not isinstance(he.detail, dict) else (he.detail.get("message") or str(he.detail)),
+                "upstream_status_code": he.status_code,
+                "auth_failed": he.status_code in (401, 403),
+            }
         )
     except Exception as e:
         latency_ms = int((time() - start_time) * 1000) if time() - start_time > 0 else None
-        
         error_message = str(e)
-        if hasattr(e, 'response'):
-            try:
-                error_data = e.response.json()
-                error_message = (
-                    error_data.get("error", {}).get("message") or
-                    error_data.get("error") or
-                    error_data.get("message") or
-                    str(error_data)
-                )
-            except Exception:
-                pass
-        
+
         logger.error(f"Channel test failed: {error_message}")
         if is_debug:
             import traceback
             traceback.print_exc()
-        
-        return _build_test_response(
-            success=False,
-            latency_ms=latency_ms,
-            message="测试失败",
-            error=error_message,
-            upstream_status_code=None,
-            stream=bool(stream),
-            error_code="CHANNEL_TEST_INTERNAL_ERROR",
-            error_category="internal",
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "latency_ms": latency_ms,
+                "message": "测试失败",
+                "error": error_message,
+                "upstream_status_code": None,
+                "auth_failed": False,
+            }
         )
 
 
@@ -748,3 +626,103 @@ async def get_models_by_groups(
     all_models.sort(key=lambda x: x["id"])
     
     return JSONResponse(content={"models": all_models})
+
+
+@router.post("/v1/channels/balance", dependencies=[Depends(rate_limit_dependency)])
+async def query_channel_balance(
+    token: str = Depends(verify_admin_api_key),
+    provider_config: dict = Body(..., description="Provider configuration for balance query")
+):
+    """
+    查询渠道余额。
+
+    根据 provider 配置中的 preferences.balance 规则，
+    向上游余额接口发请求并返回标准化的余额信息。
+
+    请求体示例:
+    {
+        "engine": "openai",
+        "base_url": "https://example.com/v1",
+        "api_key": "sk-xxx",
+        "preferences": {
+            "balance": {
+                "template": "new-api"
+            }
+        }
+    }
+    """
+    from core.balance import query_provider_balance, build_balance_config
+
+    app = get_app()
+
+    engine = provider_config.get("engine") or provider_config.get("type") or "openai"
+
+    # 构建 provider 配置
+    provider = {
+        "base_url": provider_config.get("base_url", ""),
+        "api": provider_config.get("api_key") or provider_config.get("api") or "",
+        "engine": engine,
+        "preferences": provider_config.get("preferences", {}),
+        # Vertex AI
+        "project_id": provider_config.get("project_id", ""),
+        "client_email": provider_config.get("client_email", ""),
+        "private_key": provider_config.get("private_key", ""),
+        # AWS
+        "aws_access_key": provider_config.get("aws_access_key", ""),
+        "aws_secret_key": provider_config.get("aws_secret_key", ""),
+    }
+
+    # 验证是否配置了 balance
+    balance_cfg = build_balance_config(provider)
+    if not balance_cfg:
+        return JSONResponse(content={
+            "supported": False,
+            "error": "该渠道未配置余额查询（preferences.balance）",
+        })
+
+    # 验证 base_url
+    base_url = provider.get("base_url", "")
+    if base_url and not base_url.startswith(("http://", "https://")):
+        provider["base_url"] = f"https://{base_url}"
+
+    # 代理配置
+    proxy = (
+        safe_get(provider_config, "preferences", "proxy")
+        or provider_config.get("proxy")
+        or safe_get(app.state.config, "preferences", "proxy")
+    )
+
+    try:
+        from core.http import proxy_context
+
+        with proxy_context(proxy):
+            target_url = provider.get("base_url") or "https://localhost"
+            async with app.state.client_manager.get_client(target_url, proxy) as client:
+                # 插件拦截器（和 fetch_models 同样的逻辑）
+                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                if enabled_plugins:
+                    from core.plugins.interceptors import InterceptedClient
+                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+
+                result = await query_provider_balance(client, provider)
+                return JSONResponse(content=result)
+
+    except Exception as e:
+        logger.error(f"Balance query error: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "supported": True,
+                "error": f"查询失败: {str(e)}"[:500],
+                "raw": None,
+            },
+        )
+
+
+@router.get("/v1/channels/balance_templates", dependencies=[Depends(rate_limit_dependency)])
+async def get_balance_templates(token: str = Depends(verify_admin_api_key)):
+    """
+    获取所有预置的余额查询模板列表，供前端展示选择。
+    """
+    from core.balance import list_balance_templates
+    return JSONResponse(content={"templates": list_balance_templates()})

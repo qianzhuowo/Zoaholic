@@ -16,6 +16,12 @@ def _utcnow_iso() -> str:
 
 
 def _build_health_payload(app, *, readiness: bool) -> tuple[dict[str, Any], int]:
+    """构建健康检查载荷。
+
+    readiness=False  → /healthz（存活探针）：只要进程还在、事件循环没有完全失控就返回 200。
+    readiness=True   → /readyz（就绪探针）：额外要求 startup 完成、config 已加载、
+                        client_manager 和 channel_manager 已初始化。
+    """
     state = getattr(app, "state", None)
     startup_completed = bool(getattr(state, "startup_completed", False))
     started_at = getattr(state, "started_at", None)
@@ -70,35 +76,64 @@ def _build_health_payload(app, *, readiness: bool) -> tuple[dict[str, Any], int]
 
     blocking_error = event_loop.get("status") == "critical"
     blocking_warning = event_loop.get("status") == "warning"
-    missing_runtime = not startup_completed or config is None or not hasattr(state, "client_manager") or not hasattr(state, "channel_manager")
+    missing_runtime = (
+        not startup_completed
+        or config is None
+        or not hasattr(state, "client_manager")
+        or not hasattr(state, "channel_manager")
+    )
 
-    if blocking_error or missing_runtime:
-        overall_status = "error"
-        status_code = 503
-    elif blocking_warning or needs_setup:
-        overall_status = "degraded"
-        status_code = 200
+    if readiness:
+        # /readyz：就绪探针 —— 必须完成启动且所有运行时组件就绪
+        if missing_runtime or blocking_error:
+            overall_status = "error"
+            status_code = 503
+        elif blocking_warning or needs_setup:
+            overall_status = "degraded"
+            status_code = 200
+        else:
+            overall_status = "ok"
+            status_code = 200
     else:
-        overall_status = "ok"
-        status_code = 200
+        # /healthz：存活探针 —— 只要事件循环没有完全失控就算存活
+        if blocking_error:
+            overall_status = "error"
+            status_code = 503
+        elif blocking_warning:
+            overall_status = "degraded"
+            status_code = 200
+        else:
+            overall_status = "ok"
+            status_code = 200
 
     payload = {
         "status": overall_status,
         "service": "zoaholic",
         "version": version,
         "timestamp": _utcnow_iso(),
+        "probe": "readyz" if readiness else "healthz",
         "checks": checks,
     }
+
+    # ── 运行时指标（metrics）──
+    try:
+        from core.metrics import get_full_metrics_snapshot
+        payload["metrics"] = get_full_metrics_snapshot(state)
+    except Exception:
+        payload["metrics"] = {"available": False}
+
     return payload, status_code
 
 
 @router.get("/healthz")
 async def healthz(request: Request):
+    """存活探针：进程存活且事件循环正常即返回 200"""
     payload, status_code = _build_health_payload(request.app, readiness=False)
     return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.get("/readyz")
 async def readyz(request: Request):
+    """就绪探针：要求启动完成、配置已加载、运行时组件已初始化"""
     payload, status_code = _build_health_payload(request.app, readiness=True)
     return JSONResponse(status_code=status_code, content=payload)
