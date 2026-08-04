@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
@@ -71,14 +71,39 @@ export default function Logs() {
   const [pageSize] = useState(50);
 
   // Search & Filter States
-  const [filterModel, setFilterModel] = useState('');
-  const [filterProvider, setFilterProvider] = useState('');
-  const [filterApiKey, setFilterApiKey] = useState('');
+  // 修改原因：文本筛选原来直接参与请求依赖，输入每个字符都会触发日志请求并放大竞态风险。
+  // 修改方式：将文本框的输入态和真正参与请求的提交态拆开，输入态只负责界面显示。
+  // 目的：让模型、渠道、Key 三个文本筛选只在防抖提交或手动清除时影响请求。
+  const [inputModel, setInputModel] = useState('');
+  const [inputProvider, setInputProvider] = useState('');
+  const [inputApiKey, setInputApiKey] = useState('');
+  const [committedModel, setCommittedModel] = useState('');
+  const [committedProvider, setCommittedProvider] = useState('');
+  const [committedApiKey, setCommittedApiKey] = useState('');
   const [filterSuccess, setFilterSuccess] = useState<string>('ALL');
   const [filterTimePreset, setFilterTimePreset] = useState<number | null>(null);
   const [filterStartTime, setFilterStartTime] = useState('');
   const [filterEndTime, setFilterEndTime] = useState('');
   const [showFilters, setShowFilters] = useState(false);
+  // 修改原因：清除按钮可能只清空尚未提交的输入值，此时提交态不变，普通依赖不会触发请求。
+  // 修改方式：维护一个刷新序号，清除操作递增它，让筛选请求立即重新执行。
+  // 目的：确保清除按钮不等待防抖，并且始终能立即刷新日志列表。
+  const [filterRefreshNonce, setFilterRefreshNonce] = useState(0);
+  // 修改原因：需要手写 500ms 防抖并取消上一次待提交任务，避免依赖 lodash。
+  // 修改方式：使用 useRef 保存 setTimeout 返回值，输入变化时清理旧定时器后创建新定时器。
+  // 目的：连续输入时只在最后一次输入停止 500ms 后提交文本筛选。
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 修改原因：快速筛选会产生并发请求，旧响应可能后到并覆盖新结果。
+  // 修改方式：使用 useRef 保存当前 AbortController，每次请求前 abort 上一次请求。
+  // 目的：只允许最新请求更新日志列表，避免搜索结果回退。
+  const abortControllerRef = useRef<AbortController | null>(null);
+  // 修改原因：列表接口为性能不再返回请求体、响应体和头信息，展开日志时需要单独保存完整详情。
+  // 修改方式：按日志 ID 缓存 /v1/logs/{id} 的返回，并为每条详情维护加载和错误状态。
+  // 目的：列表页保持轻量，用户展开某一条日志时才按需读取大字段。
+  const [logDetails, setLogDetails] = useState<Record<number, LogEntry>>({});
+  const [detailLoadingIds, setDetailLoadingIds] = useState<Set<number>>(new Set());
+  const [detailErrorById, setDetailErrorById] = useState<Record<number, string>>({});
+  const detailAbortControllersRef = useRef<Map<number, AbortController>>(new Map());
 
   // Accordion State
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
@@ -94,6 +119,15 @@ export default function Logs() {
 
   const fetchLogs = async (resetPage = false) => {
     if (!token) return;
+
+    // 修改原因：筛选和分页可能连续触发请求，旧请求如果后完成会覆盖新结果。
+    // 修改方式：每次请求前取消上一个 AbortController，并为本次请求创建新的 controller。
+    // 目的：让 fetch 层面停止旧请求，配合状态更新检查消除竞态覆盖。
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setLoading(true);
 
     const currentPage = resetPage ? 1 : page;
@@ -105,9 +139,9 @@ export default function Logs() {
         page_size: pageSize.toString(),
       });
 
-      if (filterModel.trim()) queryParams.append('model', filterModel.trim());
-      if (filterProvider.trim()) queryParams.append('provider', filterProvider.trim());
-      if (filterApiKey.trim()) queryParams.append('api_key', filterApiKey.trim());
+      if (committedModel.trim()) queryParams.append('model', committedModel.trim());
+      if (committedProvider.trim()) queryParams.append('provider', committedProvider.trim());
+      if (committedApiKey.trim()) queryParams.append('api_key', committedApiKey.trim());
       if (filterSuccess === 'SUCCESS') queryParams.append('success', 'true');
       if (filterSuccess === 'FAILED') queryParams.append('success', 'false');
 
@@ -115,26 +149,40 @@ export default function Logs() {
       if (start_time) queryParams.append('start_time', start_time);
       if (end_time) queryParams.append('end_time', end_time);
 
-      const res = await apiFetch(`/v1/logs?${queryParams.toString()}`);
+      const res = await apiFetch(`/v1/logs?${queryParams.toString()}`, {
+        signal: controller.signal,
+      });
 
       if (res.ok) {
         const data = await res.json();
+        // 修改原因：即使请求已被取消，也可能已经进入响应解析阶段。
+        // 修改方式：更新状态前确认当前 controller 仍是最新请求且未被 abort。
+        // 目的：防止旧请求在极端时序下覆盖新筛选结果。
+        if (controller.signal.aborted || abortControllerRef.current !== controller) return;
         const fetchedLogs = data.items || [];
         setLogs(fetchedLogs);
         setTotalCount(data.total || 0);
         setHasMore(currentPage * pageSize < (data.total || 0));
       }
     } catch (err) {
+      const errorName = typeof err === 'object' && err !== null && 'name' in err ? String(err.name) : '';
+      if (errorName === 'AbortError') return;
       console.error('Failed to fetch logs:', err);
     } finally {
-      setLoading(false);
+      // 修改原因：被取消的旧请求进入 finally 时，不应关闭新请求的加载状态。
+      // 修改方式：只有当前 controller 仍是最新请求时，才清理引用并结束 loading。
+      // 目的：避免旧请求影响新请求的界面状态。
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     fetchLogs(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterModel, filterProvider, filterApiKey, filterSuccess, filterTimePreset, filterStartTime, filterEndTime]);
+  }, [committedModel, committedProvider, committedApiKey, filterSuccess, filterTimePreset, filterStartTime, filterEndTime, filterRefreshNonce]);
 
   const loadMore = () => {
     setPage(prev => prev + 1);
@@ -147,28 +195,158 @@ export default function Logs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page]);
 
+  const fetchLogDetail = async (id: number) => {
+    if (!token || logDetails[id] || detailLoadingIds.has(id)) return;
+
+    // 修改原因：展开详情会触发单条日志请求，用户可能快速折叠、切换或离开页面。
+    // 修改方式：为每个日志详情请求创建独立 AbortController，并按日志 ID 清理加载状态。
+    // 目的：避免无效详情请求更新界面，同时保持列表请求的取消逻辑不受影响。
+    const previousController = detailAbortControllersRef.current.get(id);
+    if (previousController) previousController.abort();
+
+    const controller = new AbortController();
+    detailAbortControllersRef.current.set(id, controller);
+    setDetailLoadingIds(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setDetailErrorById(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    try {
+      const res = await apiFetch(`/v1/logs/${id}`, {
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (controller.signal.aborted || detailAbortControllersRef.current.get(id) !== controller) return;
+      setLogDetails(prev => ({ ...prev, [id]: data }));
+    } catch (err) {
+      const errorName = typeof err === 'object' && err !== null && 'name' in err ? String(err.name) : '';
+      if (errorName === 'AbortError') return;
+      console.error('Failed to fetch log detail:', err);
+      setDetailErrorById(prev => ({ ...prev, [id]: '详情加载失败' }));
+    } finally {
+      if (detailAbortControllersRef.current.get(id) === controller) {
+        detailAbortControllersRef.current.delete(id);
+        setDetailLoadingIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    }
+  };
+
   const toggleExpand = (id: number) => {
+    const willExpand = !expandedIds.has(id);
     setExpandedIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+    if (willExpand) {
+      void fetchLogDetail(id);
+    }
   };
 
+  useEffect(() => {
+    if (
+      inputModel === committedModel &&
+      inputProvider === committedProvider &&
+      inputApiKey === committedApiKey
+    ) {
+      return;
+    }
+
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(() => {
+      setCommittedModel(inputModel);
+      setCommittedProvider(inputProvider);
+      setCommittedApiKey(inputApiKey);
+      debounceTimerRef.current = null;
+    }, 500);
+
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+    };
+  }, [inputModel, inputProvider, inputApiKey, committedModel, committedProvider, committedApiKey]);
+
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      // 修改原因：详情请求独立于列表请求，组件卸载时也需要取消，避免卸载后继续更新状态。
+      // 修改方式：遍历当前按日志 ID 保存的 AbortController 并清空 Map。
+      // 目的：防止详情懒加载在页面切换后留下悬空请求。
+      detailAbortControllersRef.current.forEach(controller => controller.abort());
+      detailAbortControllersRef.current.clear();
+    };
+  }, []);
+
   const hasActiveFilters = Boolean(
-    filterModel || filterProvider || filterApiKey || filterSuccess !== 'ALL' ||
-    filterTimePreset || filterStartTime || filterEndTime
+    inputModel || inputProvider || inputApiKey ||
+    committedModel || committedProvider || committedApiKey ||
+    filterSuccess !== 'ALL' || filterTimePreset || filterStartTime || filterEndTime
   );
 
+  const triggerImmediateFilterRefresh = () => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    setFilterRefreshNonce(prev => prev + 1);
+  };
+
+  const clearModelFilter = () => {
+    setInputModel('');
+    setCommittedModel('');
+    triggerImmediateFilterRefresh();
+  };
+
+  const clearProviderFilter = () => {
+    setInputProvider('');
+    setCommittedProvider('');
+    triggerImmediateFilterRefresh();
+  };
+
+  const clearApiKeyFilter = () => {
+    setInputApiKey('');
+    setCommittedApiKey('');
+    triggerImmediateFilterRefresh();
+  };
+
   const clearAllFilters = () => {
-    setFilterModel('');
-    setFilterProvider('');
-    setFilterApiKey('');
+    setInputModel('');
+    setInputProvider('');
+    setInputApiKey('');
+    setCommittedModel('');
+    setCommittedProvider('');
+    setCommittedApiKey('');
     setFilterSuccess('ALL');
     setFilterTimePreset(null);
     setFilterStartTime('');
     setFilterEndTime('');
+    triggerImmediateFilterRefresh();
   };
 
   // ========== Helpers ==========
@@ -297,6 +475,12 @@ export default function Logs() {
   const LogAccordionItem = ({ log }: { log: LogEntry }) => {
     const isExpanded = expandedIds.has(log.id);
     const speedInfo = calculateSpeed(log);
+    // 修改原因：列表行不再携带 body/header 大字段，展开区域必须优先使用单条详情接口返回的数据。
+    // 修改方式：按日志 ID 从详情缓存中取完整记录，加载完成前仍用列表行显示基础信息。
+    // 目的：保持展开布局不变，同时把大字段读取延后到用户真正展开时。
+    const detailLog = logDetails[log.id] || log;
+    const isDetailLoading = detailLoadingIds.has(log.id);
+    const detailError = detailErrorById[log.id];
     // 缓存字段统一转成数字，目的是避免旧日志缺字段时影响列表和展开详情渲染。
     const cachedTokens = log.cached_tokens || 0;
     const cacheCreationTokens = log.cache_creation_tokens || 0;
@@ -390,38 +574,50 @@ export default function Logs() {
         {isExpanded && (
           <div className="border-t border-border bg-muted/30 p-4 space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 text-sm">
-              <InfoItem label="日志 ID" value={String(log.id)} mono />
-              <InfoItem label="完整时间" value={formatFullTimestamp(log.timestamp)} />
-              <InfoItem label="Endpoint" value={log.endpoint || '-'} mono />
-              <InfoItem label="客户端 IP" value={log.client_ip || '-'} mono />
-              <InfoItem label="Provider ID" value={log.provider_id || '-'} />
-              {log.raw_data_expires_at && <InfoItem label="数据过期" value={formatFullTimestamp(log.raw_data_expires_at)} />}
+              <InfoItem label="日志 ID" value={String(detailLog.id)} mono />
+              <InfoItem label="完整时间" value={formatFullTimestamp(detailLog.timestamp)} />
+              <InfoItem label="Endpoint" value={detailLog.endpoint || '-'} mono />
+              <InfoItem label="客户端 IP" value={detailLog.client_ip || '-'} mono />
+              <InfoItem label="Provider ID" value={detailLog.provider_id || '-'} />
+              {detailLog.raw_data_expires_at && <InfoItem label="数据过期" value={formatFullTimestamp(detailLog.raw_data_expires_at)} />}
             </div>
 
-            {log.retry_path && (
+            {detailLog.retry_path && (
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground flex items-center gap-1">
                   <RotateCcw className="w-3.5 h-3.5" /> 重试路径
                 </div>
-                <RetryPathView retryPathJson={log.retry_path} />
+                <RetryPathView retryPathJson={detailLog.retry_path} />
               </div>
             )}
-            <div className="space-y-2">
-              {/* 按数据流方向分组：请求链路（用户→上游）、响应链路（上游→用户） */}
-              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">请求 →</div>
-                <JsonAccordion title="客户端请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
-                <JsonAccordion title="客户端请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
-                <JsonAccordion title="上游请求头" data={log.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="上游请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
+            {isDetailLoading && (
+              <div className="rounded-lg border border-border bg-background/60 p-3 text-sm text-muted-foreground">
+                正在加载日志详情...
               </div>
-              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">← 响应</div>
-                <JsonAccordion title="上游响应头" data={log.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="上游响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="客户端响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
+            )}
+            {detailError && !isDetailLoading && (
+              <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-600 dark:text-red-400">
+                {detailError}
               </div>
-            </div>
+            )}
+            {!isDetailLoading && !detailError && (
+              <div className="space-y-2">
+                {/* 按数据流方向分组：请求链路（用户→上游）、响应链路（上游→用户） */}
+                <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                  <div className="text-xs font-medium text-muted-foreground tracking-wide">请求 →</div>
+                  <JsonAccordion title="客户端请求头" data={detailLog.request_headers} icon={<FileText className="w-4 h-4" />} />
+                  <JsonAccordion title="客户端请求体" data={detailLog.request_body} icon={<Eye className="w-4 h-4" />} />
+                  <JsonAccordion title="上游请求头" data={detailLog.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="上游请求体" data={detailLog.upstream_request_body} icon={<Server className="w-4 h-4" />} />
+                </div>
+                <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                  <div className="text-xs font-medium text-muted-foreground tracking-wide">← 响应</div>
+                  <JsonAccordion title="上游响应头" data={detailLog.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="上游响应体" data={detailLog.upstream_response_body} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="客户端响应体" data={detailLog.response_body} icon={<EyeOff className="w-4 h-4" />} />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -510,12 +706,12 @@ export default function Logs() {
               <div className="relative flex-1 min-w-0">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
                 <input
-                  type="text" placeholder="模型名" value={filterModel}
-                  onChange={e => setFilterModel(e.target.value)}
+                  type="text" placeholder="模型名" value={inputModel}
+                  onChange={e => setInputModel(e.target.value)}
                   className="w-full bg-background border border-border text-sm pl-8 pr-7 py-2 rounded-lg text-foreground placeholder:text-muted-foreground focus:border-primary outline-none"
                 />
-                {filterModel && (
-                  <button onClick={() => setFilterModel('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                {inputModel && (
+                  <button onClick={clearModelFilter} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                     <X className="w-3.5 h-3.5" />
                   </button>
                 )}
@@ -523,12 +719,12 @@ export default function Logs() {
               <div className="relative flex-1 min-w-0">
                 <Server className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
                 <input
-                  type="text" placeholder="渠道名" value={filterProvider}
-                  onChange={e => setFilterProvider(e.target.value)}
+                  type="text" placeholder="渠道名" value={inputProvider}
+                  onChange={e => setInputProvider(e.target.value)}
                   className="w-full bg-background border border-border text-sm pl-8 pr-7 py-2 rounded-lg text-foreground placeholder:text-muted-foreground focus:border-primary outline-none"
                 />
-                {filterProvider && (
-                  <button onClick={() => setFilterProvider('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                {inputProvider && (
+                  <button onClick={clearProviderFilter} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                     <X className="w-3.5 h-3.5" />
                   </button>
                 )}
@@ -536,12 +732,12 @@ export default function Logs() {
               <div className="relative flex-1 min-w-0">
                 <Key className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
                 <input
-                  type="text" placeholder="Key 名称 / 分组" value={filterApiKey}
-                  onChange={e => setFilterApiKey(e.target.value)}
+                  type="text" placeholder="Key 名称 / 分组" value={inputApiKey}
+                  onChange={e => setInputApiKey(e.target.value)}
                   className="w-full bg-background border border-border text-sm pl-8 pr-7 py-2 rounded-lg text-foreground placeholder:text-muted-foreground focus:border-primary outline-none"
                 />
-                {filterApiKey && (
-                  <button onClick={() => setFilterApiKey('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                {inputApiKey && (
+                  <button onClick={clearApiKeyFilter} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                     <X className="w-3.5 h-3.5" />
                   </button>
                 )}
